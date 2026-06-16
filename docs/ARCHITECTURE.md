@@ -56,13 +56,14 @@ The pipeline follows a six-stage sequential process, with each stage producing a
                     │             │              │       └─────┬────┘
                     └─────────┬──┴──────────────┴─────────────┘
                               v
-                     ┌──────────────────┐
-                     │  StackingEnsemble  │
-                     │  (4 base models +  │
-                     │  LogReg meta)       │
-                     │  Selected by        │
-                     │  validation log_loss │
-                     └────────┬──────────┘
+                      ┌──────────────────────┐
+                      │  WeightedVotingEnsemble│
+                      │  (4 base models,       │
+                      │  inverse-log-loss      │
+                      │  weighted soft voting) │
+                      │  Selected by           │
+                      │  validation log_loss    │
+                      └────────┬──────────────┘
                               │
                               v
                      ┌──────────────────┐     ┌──────────────────┐
@@ -96,7 +97,7 @@ Data acquisition from external sources. Each module is idempotent (skips if data
 | `scrape_fifa_rankings.py` | Scrape current FIFA rankings from Wikipedia; merge with historical | `data/raw/fifa_rankings_current.csv`, `data/raw/fifa_rankings_merged.csv` |
 | `scrape_world_cup_2026.py` | Scrape WC2026 group compositions and match fixtures from Wikipedia | `data/raw/wc2026_groups.csv`, `data/raw/wc2026_fixtures.csv` |
 | `scrape_odds.py` | Fetch outright odds (the-odds-api) and per-match odds (ESPN) | `data/raw/odds_outright.csv`, `data/raw/odds_match.csv` |
-| `scrape_live_results.py` | Scrape live WC2026 results from ESPN/Wikipedia; merge with manual overrides | `data/raw/wc2026_results_live.csv` |
+| `scrape_live_results.py` | Scrape live WC2026 results from ESPN/Wikipedia; merge with manual overrides. Wikipedia scraper uses match-result-box parser (finds all 13 completed matches); ESPN scraper filters out invalid rows (team names starting with "v", rows without scores). | `data/raw/wc2026_results_live.csv` |
 | `scrape_historical_world_cups.py` | Scrape historical WC brackets (1930-2022) from Wikipedia; fallback to Kaggle filter | `data/raw/historical_world_cups.csv` |
 | `scrape_squad_quality.py` | Scrape Transfermarkt for 48 WC 2026 teams: squad market value, size, avg age, foreigners, avg/top player value. Uses German-slug name mapping (`TEAM_SLUG_OVERRIDES`) and search name overrides (`TEAM_SEARCH_OVERRIDES`). Rate-limited at 2s between requests. | `data/raw/squad_quality.csv` |
 
@@ -116,10 +117,11 @@ Model training, ensemble building, evaluation, and live validation.
 
 | Module | Purpose | Output Files |
 |--------|---------|--------------|
-| `train.py` | Train XGBoost (Optuna, log loss), RandomForest (GridSearch, balanced), LogisticRegression (balanced, C-tuned), NeuralNet (sklearn MLP); draw class weight 4x; also contains `train_lightgbm()` (not called) | `data/processed/models/*.joblib` |
-| `ensemble.py` | Select best ensemble by validation log_loss: evaluates VotingEnsemble, WeightedVotingEnsemble, StackingEnsemble, and individual models. Stacking meta-learner uses `class_weight="balanced"`. Contains `CalibratedWrapper` class (preserved but not used -- calibration hurt test performance) | `data/processed/models/best_model.joblib` |
+| `train.py` | Train XGBoost (Optuna, log loss, 20 trials, 3-fold CV), RandomForest (GridSearch, balanced, max_depth=20), LogReg (balanced, C-tuned), NeuralNet (sklearn MLP); draw class weight 4x for XGBoost (default), 8x for NeuralNet; also contains `train_lightgbm()` (not called) | `data/processed/models/*.joblib` |
+| `ensemble.py` | Select best ensemble by validation log_loss: evaluates VotingEnsemble, WeightedVotingEnsemble, StackingEnsemble, and individual models. Stacking meta-learner uses LogisticRegression without class_weight. Contains `CalibratedWrapper` class (preserved but not used -- calibration hurt test performance). All models saved with `compress=3`. | `data/processed/models/best_model.joblib` |
 | `evaluate.py` | Evaluate all models on test set; generate comparison CSV, calibration curves, feature importance | `data/processed/evaluation/` |
-| `live_validation.py` | Validate best model predictions against played WC2026 matches | `data/processed/live_validation_report.csv` |
+| `live_validation.py` | Validate best model predictions against played WC2026 matches; returns `accuracy_argmax`, `accuracy_threshold`, `correct_argmax`, `correct_threshold`, `log_loss`, `total_matches`, `results` DataFrame (`draw_ratio` is a per-match column in the results DataFrame, not a top-level key) | `data/processed/live_validation_report.csv` |
+| `prediction.py` | `predict_with_draw_threshold()` and `predict_proba_with_draw_boost()` for draw-aware predictions | (utility functions) |
 
 ### `src/simulation/`
 
@@ -158,9 +160,9 @@ The project uses file-based storage exclusively (no SQL database). All intermedi
 
 The `split_data()` function in `src/models/train.py` uses a time-series split to prevent data leakage:
 
-- **Train**: Matches before 2022
-- **Validation**: Matches in 2022 (used for early stopping and ensemble selection)
-- **Test**: Matches after 2022 (held out for final evaluation)
+- **Train**: Matches before 2023
+- **Validation**: Matches in 2023 (used for early stopping and ensemble selection)
+- **Test**: Matches after 2023 (held out for final evaluation)
 
 This ensures the model never sees future data during training.
 
@@ -171,11 +173,11 @@ This ensures the model never sees future data during training.
 2. Drop rows with missing outcome
 3. Split into train / val / test by year
 4. Impute missing values with SimpleImputer (median strategy) -> saved to imputer.joblib
-5. Compute sample weights: {away_win: 1.0, draw: 4.0, home_win: 1.0}
+5. Compute sample weights: {away_win: 1.0, draw: 4.0, home_win: 1.0} (NeuralNet overrides to 8x)
 6. Train XGBoost with Optuna hyperparameter optimization (log_loss objective)
 7. Train Random Forest with GridSearch (neg_log_loss, class_weight="balanced")
 8. Train Logistic Regression with C tuning (class_weight="balanced")
-9. Train NeuralNet (sklearn MLPClassifier) with sample weights (draw 4x)
+9. Train NeuralNet (sklearn MLPClassifier) with sample weights (draw 8x)
 10. Save all models + imputer + feature columns to data/processed/models/
 ```
 
@@ -187,7 +189,7 @@ The `_get_feature_columns()` function selects features present in the data. Ther
 
 ### Draw Class Weights
 
-XGBoost and NeuralNet use explicit sample weights for the draw class (4x). Random Forest and Logistic Regression use `class_weight="balanced"` for automatic rebalancing. The Stacking ensemble meta-learner also uses `class_weight="balanced"`. This improves draw prediction without sacrificing overall accuracy.
+XGBoost and NeuralNet use explicit sample weights for the draw class (4x for XGBoost, 8x for NeuralNet). Random Forest and Logistic Regression use `class_weight="balanced"` for automatic rebalancing. The meta-learner does NOT use class_weight. This improves draw prediction without sacrificing overall accuracy.
 
 ## Ensemble Strategy
 
@@ -197,7 +199,7 @@ The `build_best_ensemble()` function in `src/models/ensemble.py` evaluates multi
 
 ### Current Best Ensemble
 
-The current best ensemble is a **StackingClassifier** with 4 base models (XGBoost, RandomForest, LogisticRegression, NeuralNet) and a LogisticRegression meta-learner with `class_weight="balanced"`. It achieved the best validation log_loss of all candidates.
+The current best ensemble is a **WeightedVotingEnsemble** with 4 base models (XGBoost, RandomForest, LogisticRegression, NeuralNet) using inverse-log-loss weighted soft voting. It achieved the best validation log_loss of all candidates.
 
 ### Candidates
 
@@ -206,11 +208,11 @@ The current best ensemble is a **StackingClassifier** with 4 base models (XGBoos
 3. **WeightedVotingEnsemble**: Soft voting with inverse-log-loss weights
 4. **StackingEnsemble**: LogisticRegression meta-learner over all base models using `predict_proba`
 
-### Stacking Details
+### Weighted Voting Details
 
-- **Meta-learner**: LogisticRegression (solver=lbfgs, max_iter=1000, class_weight="balanced")
-- **Cross-validation**: KFold(n_splits=3, shuffle=True, random_state=42)
-- **Stack method**: `predict_proba` (soft probabilities as meta-features)
+- **Weighting**: Inverse log-loss — each base model's weight is proportional to `1/log_loss_i`, so better-calibrated models contribute more
+- **Soft voting**: Probabilities from all base models are averaged using the computed weights
+- **No meta-learner**: Unlike stacking, there is no second-level model; predictions are a direct weighted average
 
 ### Why Log Loss Over Accuracy
 
@@ -349,7 +351,7 @@ Home teams receive a 100-point Elo bonus when the match is not on neutral ground
 
 ### Simulation Model
 
-The simulation uses XGBoost as the default model (fast inference, 6.6 MB), loaded from `data/processed/models/xgboost.joblib`. The trained `SimpleImputer` (median strategy) is loaded from `data/processed/models/imputer.joblib` and applied to handle missing features before prediction.
+The simulation uses XGBoost as the default model (fast inference), loaded from `data/processed/models/xgboost.joblib` (compressed with `compress=3`, ~819KB). The trained `SimpleImputer` (median strategy) is loaded from `data/processed/models/imputer.joblib` and applied to handle missing features before prediction.
 
 ### Probability Handling (Critical)
 
@@ -441,6 +443,24 @@ The `WorldCupSimulator` in `src/simulation/simulator.py` runs the complete pipel
 - 8 best third-place teams advance (total = 32)
 - Round of 32 > Round of 16 > Quarter-finals > Semi-finals > Final
 
+### Simulation Results (1,000 iterations)
+
+| Rank | Team | Win Probability |
+|------|------|-----------------|
+| 1 | Mexico | 7.9% |
+| 2 | Switzerland | 5.6% |
+| 3 | USA | 5.1% |
+| — | **Host nations total** | **17.3%** |
+
+The three host nations (Mexico, USA, Canada) together account for 17.3% of total tournament win probability, driven by `is_host_nation` and `home_advantage` features.
+
+### Live Validation Draw Results
+
+5 actual draws occurred in WC2026 group stage — all were missed by argmax prediction:
+- Canada-BIH, Qatar-SUI, Brazil-MAR, Netherlands-JPN, Spain-CPV
+
+The model is well-calibrated for draw probability but argmax rarely selects draw as the predicted outcome.
+
 ## Bug Fixes and Optimizations
 
 ### Critical Bug Fixes
@@ -470,16 +490,25 @@ The `WorldCupSimulator` in `src/simulation/simulator.py` runs the complete pipel
 | Change | Before | After |
 |--------|--------|-------|
 | LightGBM | Included in ensemble | Removed (0.49 accuracy, 0.99 log_loss) |
-| Best ensemble | Voting/Stacking selection | StackingClassifier (4 base + LogReg meta, class_weight="balanced") |
+| Best ensemble | Voting/Stacking selection | WeightedVotingEnsemble (inverse-log-loss weighted soft voting across 4 base models) |
 | Calibration | CalibratedWrapper (isotonic) | Removed (log_loss 0.8374 -> 1.0436) |
-| Simulation model | Best ensemble | XGBoost (fast, 6.6 MB) |
-| Draw sample weight (XGBoost, NeuralNet) | 1.5x | 4.0x |
-| Stacking meta-learner class_weight | None | "balanced" |
+| Simulation model | Best ensemble | XGBoost (fast, compressed with compress=3) |
+| Draw sample weight (XGBoost) | 1.5x | 4.0x (default `_compute_sample_weights`) |
+| Draw sample weight (NeuralNet) | 4.0x | 8.0x |
+| Stacking meta-learner class_weight | None | Removed (was "balanced", now no class_weight; meta-learner not used in best ensemble) |
 | ELO_DRAW_FACTOR | 0.25 | 0.30 |
 | Feature cache version | "1" | "7" |
 | Squad quality features | Not present | 8 new features (squad value, avg/top player value) |
 | WC draw calibration | Not present | `_calibrate_draw()` boosting draws to ~25% in group stage |
 | Fixture swap bug | Probabilities from wrong perspective | `swapped` flag + probability swap in 4 files |
+| Validation split | val_years=[2022] | val_years=[2023] |
+| RF max_depth | None (unlimited) | 20 (capped) |
+| RF n_estimators grid | [100,200,300] | [100,200] |
+| OPTUNA_TRIALS | 100 | 20 |
+| CV_FOLDS | 5 | 3 |
+| Model compression | No compression | compress=3 on all joblib.dump calls |
+| PyTorch import | import torch.nn in train.py (~1GB) | Removed (was causing kernel death/OOM) |
+| NEURAL_NET_DROPOUT import | Present in train.py | Removed (unused) |
 
 ### Model Optimizations
 
@@ -499,11 +528,11 @@ The `WorldCupSimulator` in `src/simulation/simulator.py` runs the complete pipel
 
 | Model | Accuracy | Log Loss | Avg Brier |
 |-------|----------|----------|-----------|
-| BestEnsemble (Stacking) | 0.620 | 0.836 | — |
-| RandomForest | 0.606 | 0.859 | — |
-| XGBoost | 0.552 | 0.918 | — |
-| LogisticRegression | 0.570 | 0.878 | — |
-| NeuralNet | 0.597 | 1.172 | — |
+| BestEnsemble (WeightedVoting) | 0.6148 | 0.8352 | -- |
+| RandomForest | 0.5933 | 0.8573 | — |
+| LogisticRegression | 0.5792 | 0.8739 | — |
+| XGBoost | 0.5047 | 0.9553 | — |
+| NeuralNet | 0.3589 | 1.7322 | — |
 
 ### Evaluation Improvement (2022 WC, 64 matches)
 

@@ -244,9 +244,11 @@ If Wikipedia scraping fails for any year, the scraper falls back to filtering th
 
 ## Live Results (Auto-Scraped)
 
-- **Source**: ESPN (primary), Wikipedia (fallback)
+- **Source**: ESPN (primary), Wikipedia (fallback — uses match-result-box parser for reliable scraping)
 - **Access**: `src/scraping/scrape_live_results.py` -- `scrape_live_results()`
 - **Output**: `data/raw/wc2026_results_live.csv`
+
+Note: The Wikipedia scraper was rewritten to use match-result-box parsing instead of group-standings parsing, which correctly finds all 13 completed WC2026 matches (was only finding 10). The ESPN scraper filters out invalid rows (team names starting with "v", rows without scores).
 
 ### Columns
 

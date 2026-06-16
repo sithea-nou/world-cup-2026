@@ -1,10 +1,8 @@
 import warnings
-from pathlib import Path
 
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.metrics import accuracy_score, log_loss
 
 from src.config import PROCESSED_DIR, RAW_DIR
 from src.helpers import logger
@@ -15,7 +13,7 @@ LABEL_MAP = {1: 2, 0: 1, -1: 0}
 LABEL_NAMES = ["away_win", "draw", "home_win"]
 
 
-def validate_against_live(model, feature_cols: list[str]) -> dict:
+def validate_against_live(model, feature_cols: list[str], draw_threshold: float = 0.85) -> dict:
     logger.info("Validating model against live WC 2026 results...")
 
     live_path = RAW_DIR / "wc2026_results_live.csv"
@@ -44,7 +42,6 @@ def validate_against_live(model, feature_cols: list[str]) -> dict:
     if imputer_path.exists():
         imputer = joblib.load(imputer_path)
 
-    available_cols = [c for c in feature_cols if c in wc_features.columns]
     missing_cols = [c for c in feature_cols if c not in wc_features.columns]
 
     if missing_cols:
@@ -52,7 +49,8 @@ def validate_against_live(model, feature_cols: list[str]) -> dict:
             wc_features[col] = 0.0
 
     validation_results = []
-    correct = 0
+    correct_argmax = 0
+    correct_threshold = 0
     total = 0
     total_log_loss = 0
 
@@ -94,16 +92,23 @@ def validate_against_live(model, feature_cols: list[str]) -> dict:
             X[nan_mask] = np.take(col_means, nan_mask.nonzero()[1])
 
         proba = model.predict_proba(X)[0]
-        pred_class = model.predict(X)[0]
+        pred_argmax = model.predict(X)[0]
 
         if swapped:
             proba_swapped = np.array([proba[2], proba[1], proba[0]])
             proba = proba_swapped
-            pred_class = {0: 2, 1: 1, 2: 0}[pred_class]
+            pred_argmax = {0: 2, 1: 1, 2: 0}[pred_argmax]
 
-        is_correct = pred_class == actual
-        if is_correct:
-            correct += 1
+        max_non_draw = max(proba[0], proba[2])
+        draw_ratio = proba[1] / max_non_draw if max_non_draw > 0 else 0
+        pred_threshold = 1 if draw_ratio > draw_threshold else pred_argmax
+
+        is_correct_argmax = pred_argmax == actual
+        is_correct_threshold = pred_threshold == actual
+        if is_correct_argmax:
+            correct_argmax += 1
+        if is_correct_threshold:
+            correct_threshold += 1
         total += 1
 
         actual_prob = proba[actual]
@@ -116,11 +121,13 @@ def validate_against_live(model, feature_cols: list[str]) -> dict:
                 "home_score": home_score,
                 "away_score": away_score,
                 "actual_outcome": LABEL_NAMES[actual],
-                "predicted_outcome": LABEL_NAMES[pred_class],
+                "predicted_outcome": LABEL_NAMES[pred_threshold],
+                "predicted_argmax": LABEL_NAMES[pred_argmax],
                 "prob_home_win": proba[2],
                 "prob_draw": proba[1],
                 "prob_away_win": proba[0],
-                "correct": is_correct,
+                "draw_ratio": draw_ratio,
+                "correct": is_correct_threshold,
             }
         )
 
@@ -128,12 +135,14 @@ def validate_against_live(model, feature_cols: list[str]) -> dict:
         logger.warning("No matches could be validated")
         return {}
 
-    accuracy = correct / total
+    accuracy_argmax = correct_argmax / total
+    accuracy_threshold = correct_threshold / total
     avg_log_loss = total_log_loss / total
 
-    logger.info(f"Live validation results:")
+    logger.info("Live validation results:")
     logger.info(f"  Matches: {total}")
-    logger.info(f"  Accuracy: {accuracy:.4f}")
+    logger.info(f"  Accuracy (argmax): {accuracy_argmax:.4f}")
+    logger.info(f"  Accuracy (draw threshold {draw_threshold}): {accuracy_threshold:.4f}")
     logger.info(f"  Log Loss: {avg_log_loss:.4f}")
 
     results_df = pd.DataFrame(validation_results)
@@ -145,15 +154,19 @@ def validate_against_live(model, feature_cols: list[str]) -> dict:
         marker = "✓" if r["correct"] else "✗"
         logger.info(
             f"  {marker} {r['home_team']} {r['home_score']}-{r['away_score']} {r['away_team']} "
-            f"| Pred: {r['predicted_outcome']} | Actual: {r['actual_outcome']} "
-            f"| H:{r['prob_home_win']:.2f} D:{r['prob_draw']:.2f} A:{r['prob_away_win']:.2f}"
+            f"| Pred: {r['predicted_outcome']} (argmax: {r['predicted_argmax']}) "
+            f"| Actual: {r['actual_outcome']} "
+            f"| H:{r['prob_home_win']:.2f} D:{r['prob_draw']:.2f} A:{r['prob_away_win']:.2f} "
+            f"| D/max: {r['draw_ratio']:.2f}"
         )
 
     return {
-        "accuracy": accuracy,
+        "accuracy_argmax": accuracy_argmax,
+        "accuracy_threshold": accuracy_threshold,
         "log_loss": avg_log_loss,
         "total_matches": total,
-        "correct": correct,
+        "correct_argmax": correct_argmax,
+        "correct_threshold": correct_threshold,
         "results": results_df,
     }
 

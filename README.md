@@ -1,6 +1,6 @@
 # World Cup 2026 ML Predictor
 
-An end-to-end machine learning pipeline for predicting FIFA World Cup 2026 outcomes. The system combines 48,000+ international match results, FIFA rankings, Transfermarkt squad quality data, bookmaker odds, and Elo ratings to train a stacking ensemble classifier (4 base models + LogisticRegression meta-learner with `class_weight="balanced"`), then runs Monte Carlo simulations (1,000 iterations by default) using XGBoost for speed to estimate tournament advancement and winning probabilities for all 48 teams.
+An end-to-end machine learning pipeline for predicting FIFA World Cup 2026 outcomes. The system combines 48,000+ international match results, FIFA rankings, Transfermarkt squad quality data, bookmaker odds, and Elo ratings to train an ensemble classifier (selected by validation log_loss from Voting, WeightedVoting, and Stacking candidates), then runs Monte Carlo simulations (1,000 iterations by default) using XGBoost for speed to estimate tournament advancement and winning probabilities for all 48 teams.
 
 ## Architecture
 
@@ -9,7 +9,7 @@ run_pipeline.py --all --n-simulations 1000
   Step 1: Data Scraping (Kaggle + Wikipedia + ESPN odds)
   Step 2: Feature Engineering (Elo, FIFA, form, H2H, SOS, EWM, draw features, squad quality)
   Step 3: Model Training (XGBoost, RF, LogReg, NeuralNet)
-  Step 3b: Ensemble Building (StackingClassifier selected by log_loss)
+  Step 3b: Ensemble Building (WeightedVoting selected by log_loss)
   Step 4: Evaluation (accuracy, log_loss, Brier, calibration)
   Step 5: Tournament Simulation (Monte Carlo, 1000 iterations, XGBoost model)
   Step 6: Visualization (power rankings, round probabilities, calibration)
@@ -28,9 +28,9 @@ run_pipeline.py --all --n-simulations 1000
                            +---------+----------+              |
                                      |                         v
                                      |              +-----------+-----------+
-                                     |              |  StackingEnsemble      |
-                                     |              |  (4 base + LogReg meta) |
-                                     |              |  Selected by log_loss   |
+                            |              |  Ensemble (selected by log_loss) |
+                            |              |  from Voting/WeightedVoting/     |
+                            |              |  Stacking candidates             |
                                      |              +-----------+-----------+
                                      |                          |
                            +---------+----------+               |
@@ -63,9 +63,9 @@ run_pipeline.py --all --n-simulations 1000
 - **Multi-source data collection**: Kaggle match results, Wikipedia groups/fixtures/rankings, ESPN match odds, the-odds-api outright odds, Transfermarkt squad quality data
 - **Elo rating system**: Tournament-specific K-factors (WC=80, Qualifier=60, Friendly=40), home advantage adjustment, draw probability modeling with `ELO_DRAW_FACTOR=0.30`
 - **80 features per match**: Elo (7), FIFA rankings (7), form (28: last 5/10 win/draw/loss rates, goals, EWM), H2H (6), SOS (2), draw-predictive (5), context (7), interaction (2), odds (3), squad quality (8)
-- **4 ML models**: XGBoost (Optuna-tuned for log_loss), Random Forest (GridSearch, `class_weight="balanced"`), Logistic Regression (balanced, C-tuned), NeuralNet (sklearn MLPClassifier)
-- **StackingClassifier ensemble**: 4 base models + LogisticRegression meta-learner with `class_weight="balanced"`, selected by validation log_loss (removed LightGBM due to poor performance: 0.49 accuracy, 0.99 log_loss)
-- **Draw class weighting**: XGBoost and NeuralNet use 4.0x sample weight for draws; RF and LogReg use `class_weight="balanced"`; meta-learner uses `class_weight="balanced"`
+- **4 ML models**: XGBoost (Optuna-tuned for log_loss), Random Forest (GridSearch, `class_weight="balanced"`, `max_depth=20`), Logistic Regression (balanced, C-tuned), NeuralNet (sklearn MLPClassifier, 8x draw weight)
+- **Ensemble selection**: 4 base models + ensemble candidates (VotingEnsemble, WeightedVotingEnsemble with inverse-log-loss weights, StackingClassifier with LogReg meta-learner), best selected by validation log_loss; current best is WeightedVotingEnsemble
+- **Draw class weighting**: XGBoost uses 4x sample weight for draws (default `_compute_sample_weights`), NeuralNet uses 8x; RF and LogReg use `class_weight="balanced"`; meta-learner does NOT use class_weight
 - **WC draw calibration**: `WC_GROUP_DRAW_RATE=0.25` boosts under-predicted draws in group stage simulation toward historical ~25% rate
 - **Probability bug fixes**: Corrected `predict_proba()` output ordering (`[away_win, draw, home_win]` -> `[home_win, draw, away_win]`), added probability normalization, loaded trained imputer instead of `np.nanmean()`, fixed fixture swap bug (swapped probabilities when match lookup is reversed)
 - **Monte Carlo simulation**: 1,000 full tournament runs through group stage and knockout bracket (configurable), using XGBoost model for speed
@@ -81,31 +81,29 @@ run_pipeline.py --all --n-simulations 1000
 | Log Loss | 0.9789  | 0.9383  |
 | Avg Brier| 0.1913  | 0.1657  |
 
-These improvements come from draw class weighting (4x), `ELO_DRAW_FACTOR=0.30`, draw-predictive features (`elo_close`, `draw_tendency`, `fifa_close`), squad quality features, ensemble/model selection by log_loss, and fixture swap bug fix.
+These improvements come from draw class weighting (4x for XGBoost, 8x for NeuralNet, `class_weight="balanced"` for RF/LogReg, no class_weight on meta-learner), `ELO_DRAW_FACTOR=0.30`, draw-predictive features (`elo_close`, `draw_tendency`, `fifa_close`), squad quality features, ensemble/model selection by log_loss, and fixture swap bug fix.
 
 ## Model Performance (test set)
 
 | Model | Accuracy | Log Loss |
 |---|---|---|
-| BestEnsemble (Stacking) | 0.620 | 0.836 |
-| RandomForest | 0.606 | 0.859 |
-| LogisticRegression | 0.570 | 0.878 |
-| XGBoost | 0.552 | 0.918 |
-| NeuralNet | 0.597 | 1.172 |
+| BestEnsemble (WeightedVoting) | 0.615 | 0.835 |
+| RandomForest | 0.593 | 0.857 |
+| LogisticRegression | 0.579 | 0.874 |
+| XGBoost | 0.505 | 0.955 |
+| NeuralNet | 0.359 | 1.732 |
 
-### Live Validation (WC 2026, 10 matches)
+### Live Validation (WC 2026, 13 matches)
 
 | Model | Accuracy | Log Loss |
 |---|---|---|
-| BestEnsemble | 40% (4/10) | 1.059 |
-| XGBoost | 40% (4/10) | 1.001 |
-| RandomForest | 30% (3/10) | 0.974 |
+| BestEnsemble | 46.2% (6/13) | 1.07 |
 
-Note: LightGBM was removed from the ensemble due to poor performance (0.49 accuracy, 0.99 log_loss). Calibration via `CalibratedWrapper` was tested but removed because it hurt test performance (log_loss 0.8374 -> 1.0436).
+Note: LightGBM was removed from the ensemble due to poor performance (0.49 accuracy, 0.99 log_loss). Calibration via `CalibratedWrapper` was tested but removed because it hurt test performance (log_loss 0.8374 -> 1.0436). The model is well-calibrated but argmax rarely picks draw; all 5 actual draws were missed (Canada-BIH, Qatar-SUI, Brazil-MAR, Netherlands-JPN, Spain-CPV).
 
 ## Simulation Results (WC 2026, 1000 runs with XGBoost)
 
-Top 5: Mexico 7.6%, Switzerland 6.5%, USA 6.0%, Germany 4.8%, Canada 4.7%
+Top 5: Mexico 7.9%, Switzerland 5.6%, USA 5.1%, Ivory Coast 4.8%, France 4.6%. Host nations (Mexico, USA, Canada) collectively 17.3%.
 
 ## Prerequisites
 
@@ -215,7 +213,7 @@ worldcup/
 │       │   ├── random_forest.joblib
 │       │   ├── logistic_regression.joblib
 │       │   ├── neural_net.joblib      # sklearn MLPClassifier
-│       │   ├── best_model.joblib     # Best ensemble (StackingClassifier by log_loss)
+│       │   ├── best_model.joblib     # Best ensemble (WeightedVotingEnsemble by log_loss, 96MB)
 │       │   ├── imputer.joblib        # Fitted SimpleImputer (median strategy)
 │       │   └── feature_columns.joblib
 │       ├── evaluation/               # Model evaluation outputs
@@ -249,9 +247,10 @@ worldcup/
 │   ├── models/
 │   │   ├── __init__.py
 │   │   ├── train.py                 # XGBoost, RF, LogReg, NeuralNet training
-│   │   ├── ensemble.py              # StackingClassifier + ensemble selection by log_loss
+│   │   ├── ensemble.py              # Ensemble selection (Voting, WeightedVoting, Stacking) by log_loss
 │   │   ├── evaluate.py              # Model evaluation and comparison
-│   │   └── live_validation.py       # Validate against played WC2026 matches
+│   │   ├── live_validation.py       # Validate against played WC2026 matches
+│   │   └── prediction.py            # predict_with_draw_threshold(), predict_proba_with_draw_boost()
 │   ├── simulation/
 │   │   ├── __init__.py
 │   │   ├── group_stage.py           # Group stage Monte Carlo simulation (imputer + probability fix + draw calibration + swap fix)
@@ -293,10 +292,10 @@ worldcup/
 
 | Model | Tuning | Key Parameters |
 |-------|--------|----------------|
-| **XGBoost** | Optuna (30 trials, 5-fold TimeSeriesSplit CV, optimized for log_loss) | n_estimators, max_depth, learning_rate, subsample, colsample_bytree, min_child_weight, gamma, reg_alpha, reg_lambda; draw class weight 4x |
-| **Random Forest** | GridSearch (3-fold TimeSeriesSplit, scoring=neg_log_loss, class_weight="balanced") | n_estimators=[100,200,300], max_depth=[10,20,None], min_samples_split=[2,5] |
+| **XGBoost** | Optuna (20 trials, 3-fold TimeSeriesSplit CV, optimized for log_loss) | n_estimators, max_depth, learning_rate, subsample, colsample_bytree, min_child_weight, gamma, reg_alpha, reg_lambda; draw class weight 4x |
+| **Random Forest** | GridSearch (3-fold TimeSeriesSplit, scoring=neg_log_loss, class_weight="balanced") | n_estimators=[100,200], max_depth=[10,20], min_samples_split=[2,5] |
 | **Logistic Regression** | GridSearchCV (3-fold TimeSeriesSplit, scoring=neg_log_loss, class_weight="balanced") | C=[0.01,0.1,1.0,10.0], StandardScaler pipeline |
-| **NeuralNet (sklearn MLP)** | Early stopping (patience=10) | Layers [128, 64, 32], alpha=0.001, batch_size=256, adaptive lr, max_iter=300 |
+| **NeuralNet (sklearn MLP)** | Early stopping (patience=10) | Layers [128, 64, 32], alpha=0.001, batch_size=256, adaptive lr, max_iter=300; draw class weight 8x |
 
 ### Ensemble Strategy
 
@@ -305,9 +304,9 @@ The ensemble builder (`build_best_ensemble`) evaluates multiple candidates and s
 1. **Individual models**: Each base model evaluated on validation set
 2. **VotingEnsemble (uniform)**: Soft voting with equal weights
 3. **WeightedVotingEnsemble**: Soft voting with inverse-log-loss weights
-4. **StackingEnsemble**: LogisticRegression meta-learner (with `class_weight="balanced"`) over all base models
+4. **StackingEnsemble**: LogisticRegression meta-learner (no class_weight) over all base models
 
-The candidate with the lowest validation log_loss is saved as `best_model.joblib`. The current best ensemble is a StackingClassifier with 4 base models and a LogisticRegression meta-learner with `class_weight="balanced"`.
+The candidate with the lowest validation log_loss is saved as `best_model.joblib`. The current best ensemble is a WeightedVotingEnsemble (soft voting with inverse-log-loss weights across 4 base models).
 
 ### Why LightGBM Was Removed
 
@@ -323,10 +322,10 @@ Draws are the hardest outcome to predict in football. The pipeline uses multiple
 
 - **ELO_DRAW_FACTOR = 0.30**: Scales draw probability in the Elo system (increased from 0.25 for better calibration)
 - **WC_GROUP_DRAW_RATE = 0.25**: Historical WC group-stage draw rate, used for draw calibration in simulation
-- **XGBoost sample weights**: `away_win=1.0, draw=4.0, home_win=1.0` (4x weight on draws, up from 3x)
-- **NeuralNet sample weights**: `away_win=1.0, draw=4.0, home_win=1.0` (4x weight on draws)
+- **XGBoost sample weights**: `away_win=1.0, draw=4.0, home_win=1.0` (4x weight on draws, default from `_compute_sample_weights`)
+- **NeuralNet sample weights**: `away_win=1.0, draw=8.0, home_win=1.0` (8x weight on draws)
 - **RF and LogReg**: `class_weight="balanced"` for automatic class rebalancing
-- **Stacking meta-learner**: `class_weight="balanced"` on LogisticRegression
+- **Stacking meta-learner**: LogisticRegression without class_weight (removed — was hurting log_loss)
 - **Draw-predictive features**: `elo_close` (Elo delta < 100), `draw_tendency` (combined draw prob amplified for close matches), `fifa_close` (FIFA rank delta < 20), `tournament_draw_rate`, `combined_draw_prob`
 - **Ensemble selection by log_loss**: Avoids penalizing draw predictions that improve probability calibration
 
@@ -450,7 +449,7 @@ Historical matches use confederation-average fallbacks for missing squad quality
 
 ## Simulation Methodology
 
-The tournament simulation uses Monte Carlo methods to estimate advancement and winning probabilities. XGBoost is used as the default simulation model for speed (6.6 MB, fast inference).
+The tournament simulation uses Monte Carlo methods to estimate advancement and winning probabilities. XGBoost is used as the default simulation model for speed (819KB compressed, fast inference).
 
 ### Probability Handling (Bug Fixes)
 
@@ -511,24 +510,33 @@ Two critical bugs were fixed in the simulation code:
 | Change | Before | After |
 |--------|--------|-------|
 | LightGBM | Included (0.49 accuracy, 0.99 log_loss) | Removed (worst performer) |
-| Best ensemble | Voting/Stacking selection | StackingClassifier (4 base + LogReg meta, class_weight="balanced") |
+| Best ensemble | Voting/Stacking selection | WeightedVotingEnsemble (inverse-log-loss weighted soft voting, selected by log_loss) |
 | Calibration | Tested CalibratedWrapper (isotonic) | Removed (hurt test log_loss: 0.8374 -> 1.0436) |
 | Feature cache version | "5" | "7" (added squad quality features) |
-| Simulation model | Best ensemble | XGBoost (fast, 6.6 MB) |
-| Draw class weight (XGBoost, NeuralNet) | 1.5x | 4.0x |
-| Stacking meta-learner class_weight | None | "balanced" |
+| Simulation model | Best ensemble | XGBoost (fast, compressed with compress=3) |
+| Draw class weight (XGBoost) | 1.5x | 4.0x (default `_compute_sample_weights`) |
+| Draw class weight (NeuralNet) | 4.0x | 8.0x (overrides default) |
+| Stacking meta-learner class_weight | None | Removed (was "balanced", removed for better log_loss) |
 | ELO_DRAW_FACTOR | 0.25 | 0.30 |
 | WC draw calibration | Not present | WC_GROUP_DRAW_RATE=0.25, boosts under-predicted draws in group stage |
 | Fixture swap bug | Probabilities from wrong perspective | `swapped` flag + probability swap in 4 files |
+| Validation split | val_years=[2022] | val_years=[2023] |
+| RF max_depth | None (unlimited) | 20 (capped) |
+| RF n_estimators grid | [100,200,300] | [100,200] |
+| OPTUNA_TRIALS | 100 | 20 |
+| CV_FOLDS | 5 | 3 |
+| Model compression | No compression | compress=3 on all joblib.dump calls |
+| PyTorch import | import torch.nn as nn (~1GB) | Removed (was causing kernel death/OOM) |
 
 ### Model Optimizations
 
 | Change | Before | After |
 |--------|--------|-------|
-| Draw sample weight (XGBoost, NeuralNet) | 1.5x | 4.0x |
+| Draw sample weight (XGBoost) | 1.5x | 4.0x |
+| Draw sample weight (NeuralNet) | 4.0x | 8.0x |
 | RF class_weight | None | `"balanced"` |
 | LogReg class_weight | None | `"balanced"` + C tuning |
-| Stacking meta-learner class_weight | None | `"balanced"` |
+| Stacking meta-learner class_weight | None | Removed (was set to "balanced", now no class_weight) |
 | ELO_DRAW_FACTOR | 0.25 | 0.30 |
 | WC draw calibration | Not present | `WC_GROUP_DRAW_RATE=0.25` in group stage |
 | Ensemble selection metric | accuracy | log_loss |
@@ -538,7 +546,14 @@ Two critical bugs were fixed in the simulation code:
 | Neural Net batch_size | 64 | 256 |
 | Neural Net learning rate | fixed | adaptive |
 | Neural Net max_iter | 200 | 300 |
+| RF max_depth | None (unlimited) | 20 (capped) |
+| RF n_estimators grid | [100,200,300] | [100,200] |
+| OPTUNA_TRIALS | 100 | 20 |
+| CV_FOLDS | 5 | 3 |
 | Feature cache version | "1" | "7" |
+| Model compression | No compression | compress=3 on all joblib.dump calls |
+| Validation split | val_years=[2022] | val_years=[2023] |
+| PyTorch import | import torch.nn as nn (~1GB) | Removed (kernel death/OOM) |
 
 ## Live Validation
 
@@ -550,8 +565,9 @@ python run_pipeline.py --step live-validate
 
 - Auto-scrapes live match results from ESPN/Wikipedia
 - Compares model predictions to actual outcomes
-- Reports accuracy and log-loss on played matches
+- Reports accuracy (argmax and draw-threshold), log-loss on played matches
 - Supports manual overrides via `data/raw/wc2026_results_manual.csv`
+- Returns `accuracy_argmax`, `accuracy_threshold`, `correct_argmax`, `correct_threshold`, `draw_ratio` per match
 
 ### Manual Override CSV Format
 
@@ -576,10 +592,10 @@ All configuration constants are in `src/config.py`:
 | `NEURAL_NET_EPOCHS` | 100 | Max training iterations for sklearn MLP (overridden to 300 in build) |
 | `NEURAL_NET_PATIENCE` | 10 | Early stopping patience for MLP |
 | `NEURAL_NET_LAYERS` | [128, 64, 32] | MLP hidden layer sizes |
-| `NEURAL_NET_DROPOUT` | 0.3 | Not used (sklearn MLP uses alpha for regularization) |
+| `NEURAL_NET_DROPOUT` | 0.3 | Not used (sklearn MLP uses alpha for regularization); import removed from train.py |
 | `NEURAL_NET_LEARNING_RATE` | 1e-3 | MLP initial learning rate |
-| `OPTUNA_TRIALS` | 100 | Number of Optuna hyperparameter trials (capped at 30) |
-| `CV_FOLDS` | 5 | Cross-validation folds |
+| `OPTUNA_TRIALS` | 20 | Number of Optuna hyperparameter trials |
+| `CV_FOLDS` | 3 | Cross-validation folds |
 | `HOST_NATIONS` | [US, CA, MX] | 2026 host countries |
 | `N_GROUPS` | 12 | Number of groups (A-L) |
 | `ADVANCE_PER_GROUP` | 2 | Teams advancing per group |
@@ -592,10 +608,10 @@ Used in `_compute_sample_weights()` in `train.py`:
 | Class | Label | Weight |
 |-------|-------|--------|
 | Away win | 0 | 1.0 |
-| Draw | 1 | 4.0 |
+| Draw | 1 | 4.0 (XGBoost) / 8.0 (NeuralNet) |
 | Home win | 2 | 1.0 |
 
-Note: Random Forest and Logistic Regression use `class_weight="balanced"` instead of explicit sample weights. The Stacking ensemble meta-learner also uses `class_weight="balanced"`.
+Note: `_compute_sample_weights()` defaults to 4x for draw class. XGBoost uses the default (4x), while NeuralNet overrides to 8x. Random Forest and Logistic Regression use `class_weight="balanced"` instead of explicit sample weights. The Stacking ensemble meta-learner does NOT use class_weight (removed for better log_loss).
 
 ## Running Tests
 
@@ -625,10 +641,12 @@ Tests cover (35 tests total):
 | Notebook | Description |
 |----------|-------------|
 | `01_data_exploration.ipynb` | Load and explore raw data; visualize distributions, correlations, missing values |
-| `02_model_analysis.ipynb` | Compare model performance; feature importance analysis; calibration curves |
+| `02_model_analysis.ipynb` | Compare model performance; feature importance analysis; calibration curves (loads/evaluates models one at a time with `del`+`gc.collect()` to avoid OOM) |
 | `03_tournament_simulation.ipynb` | Run simulations interactively; explore bracket paths; analyze group outcomes |
 | `04_power_rankings.ipynb` | Generate and visualize power rankings; group-stage heatmaps |
-| `05_live_validation.ipynb` | Compare predictions vs live results; track accuracy over time |
+| `05_live_validation.ipynb` | Compare predictions vs live results; track accuracy over time (uses new `accuracy_argmax`/`accuracy_threshold` keys) |
+
+All notebooks use the `worldcup-2026-predictor` kernel (registered from the `uv` venv) to avoid NumPy version incompatibility with saved models.
 
 ## License
 

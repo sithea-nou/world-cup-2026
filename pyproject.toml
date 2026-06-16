@@ -21,6 +21,7 @@ dependencies = [
     "pyarrow>=17.0",
     "joblib>=1.4",
     "lightgbm>=4.6.0",
+    "fpdf2>=2.8.7",
 ]
 
 [project.optional-dependencies]
