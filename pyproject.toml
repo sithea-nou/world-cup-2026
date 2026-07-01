@@ -22,6 +22,7 @@ dependencies = [
     "joblib>=1.4",
     "lightgbm>=4.6.0",
     "fpdf2>=2.8.7",
+    "pillow>=12.2.0",
 ]
 
 [project.optional-dependencies]
