@@ -1,23 +1,16 @@
 import warnings
-from pathlib import Path
 
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.calibration import CalibratedClassifierCV
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import TimeSeriesSplit, cross_val_score
-from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
-
-import torch
-import torch.nn as nn
 
 from src.config import (
     CV_FOLDS,
-    NEURAL_NET_DROPOUT,
-    NEURAL_NET_EPOCHS,
     NEURAL_NET_LAYERS,
     NEURAL_NET_LEARNING_RATE,
     NEURAL_NET_PATIENCE,
@@ -153,7 +146,7 @@ def _get_feature_columns(df: pd.DataFrame) -> list[str]:
 
 
 def split_data(
-    df: pd.DataFrame, test_year: int = 2022, val_years: list[int] | None = None
+    df: pd.DataFrame, test_year: int = 2023, val_years: list[int] | None = None
 ) -> tuple:
     logger.info("Splitting data...")
 
@@ -161,7 +154,7 @@ def split_data(
     df["date"] = pd.to_datetime(df["date"])
 
     if val_years is None:
-        val_years = [2022]
+        val_years = [2023]
 
     train_mask = df["date"].dt.year < min(val_years)
     val_mask = df["date"].dt.year.isin(val_years)
@@ -183,25 +176,36 @@ def split_data(
     y_test = test_df[TARGET_COLUMN].map(LABEL_MAP).values
 
     from sklearn.impute import SimpleImputer
+
     imputer = SimpleImputer(strategy="median")
     X_train = np.ascontiguousarray(imputer.fit_transform(X_train), dtype=np.float32)
     X_val = np.ascontiguousarray(imputer.transform(X_val), dtype=np.float32)
     X_test = np.ascontiguousarray(imputer.transform(X_test), dtype=np.float32)
 
     import joblib
+
     imputer_path = PROCESSED_DIR / "models" / "imputer.joblib"
     imputer_path.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump(imputer, imputer_path)
+    joblib.dump(imputer, imputer_path, compress=3)
 
     return (
-        X_train, y_train, X_val, y_val, X_test, y_test,
-        feature_cols, train_df, val_df, test_df,
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+        X_test,
+        y_test,
+        feature_cols,
+        train_df,
+        val_df,
+        test_df,
     )
 
 
-def _compute_sample_weights(y_train):
+def _compute_sample_weights(y_train, draw_weight: float = 4.0):
     from sklearn.utils.class_weight import compute_sample_weight
-    class_weights = {0: 1.0, 1: 4.0, 2: 1.0}
+
+    class_weights = {0: 1.0, 1: draw_weight, 2: 1.0}
     return compute_sample_weight(class_weights, y_train)
 
 
@@ -247,6 +251,7 @@ def train_xgboost(X_train, y_train, X_val=None, y_val=None) -> dict:
                     verbose=False,
                 )
                 from sklearn.metrics import log_loss
+
                 y_prob = model.predict_proba(X_val)
                 score = log_loss(y_val, y_prob)
             else:
@@ -280,7 +285,13 @@ def train_xgboost(X_train, y_train, X_val=None, y_val=None) -> dict:
     )
 
     if X_val is not None and y_val is not None:
-        model.fit(X_train, y_train, sample_weight=sample_weights, eval_set=[(X_val, y_val)], verbose=False)
+        model.fit(
+            X_train,
+            y_train,
+            sample_weight=sample_weights,
+            eval_set=[(X_val, y_val)],
+            verbose=False,
+        )
     else:
         model.fit(X_train, y_train, sample_weight=sample_weights)
 
@@ -294,8 +305,8 @@ def train_random_forest(X_train, y_train) -> dict:
     from sklearn.model_selection import GridSearchCV
 
     param_grid = {
-        "n_estimators": [100, 200, 300],
-        "max_depth": [10, 20, None],
+        "n_estimators": [100, 200],
+        "max_depth": [10, 20],
         "min_samples_split": [2, 5],
         "max_features": ["sqrt"],
         "class_weight": ["balanced"],
@@ -326,15 +337,20 @@ def train_logistic_regression(X_train, y_train) -> dict:
 
     from sklearn.model_selection import GridSearchCV
 
-    pipeline = Pipeline([
-        ("scaler", StandardScaler()),
-        ("lr", LogisticRegression(
-            solver="lbfgs",
-            max_iter=2000,
-            random_state=RANDOM_STATE,
-            class_weight="balanced",
-        )),
-    ])
+    pipeline = Pipeline(
+        [
+            ("scaler", StandardScaler()),
+            (
+                "lr",
+                LogisticRegression(
+                    solver="lbfgs",
+                    max_iter=2000,
+                    random_state=RANDOM_STATE,
+                    class_weight="balanced",
+                ),
+            ),
+        ]
+    )
 
     param_grid = {"lr__C": [0.01, 0.1, 1.0, 10.0]}
     tscv = TimeSeriesSplit(n_splits=3)
@@ -342,7 +358,11 @@ def train_logistic_regression(X_train, y_train) -> dict:
     grid.fit(X_train, y_train)
 
     logger.info(f"Logistic Regression best C: {grid.best_params_['lr__C']}")
-    return {"model": grid.best_estimator_, "params": grid.best_params_, "name": "LogisticRegression"}
+    return {
+        "model": grid.best_estimator_,
+        "params": grid.best_params_,
+        "name": "LogisticRegression",
+    }
 
 
 def train_lightgbm(X_train, y_train, X_val=None, y_val=None) -> dict:
@@ -371,7 +391,8 @@ def train_lightgbm(X_train, y_train, X_val=None, y_val=None) -> dict:
 
     if X_val is not None and y_val is not None:
         model.fit(
-            X_train, y_train,
+            X_train,
+            y_train,
             sample_weight=sample_weights,
             eval_set=[(X_val, y_val)],
             callbacks=[
@@ -382,7 +403,11 @@ def train_lightgbm(X_train, y_train, X_val=None, y_val=None) -> dict:
     else:
         model.fit(X_train, y_train, sample_weight=sample_weights)
 
-    return {"model": model, "params": {"n_estimators": 500, "max_depth": 7, "learning_rate": 0.05}, "name": "LightGBM"}
+    return {
+        "model": model,
+        "params": {"n_estimators": 500, "max_depth": 7, "learning_rate": 0.05},
+        "name": "LightGBM",
+    }
 
 
 def train_neural_net(X_train, y_train, X_val=None, y_val=None) -> dict:
@@ -390,21 +415,21 @@ def train_neural_net(X_train, y_train, X_val=None, y_val=None) -> dict:
     logger.info("Training Neural Network (sklearn MLP)...")
 
     model = _build_sklearn_mlp()
-    sample_weights = _compute_sample_weights(y_train)
+    sample_weights = _compute_sample_weights(y_train, draw_weight=8.0)
 
     if X_val is not None and y_val is not None:
         X_combined = np.vstack([X_train, X_val])
         y_combined = np.concatenate([y_train, y_val])
-        sw_combined = np.concatenate([sample_weights, _compute_sample_weights(y_val)])
-        model.fit(X_combined, y_combined)
+        val_weights = _compute_sample_weights(y_val, draw_weight=8.0)
+        sw_combined = np.concatenate([sample_weights, val_weights])
+        model.fit(X_combined, y_combined, sample_weight=sw_combined)
     else:
-        model.fit(X_train, y_train)
+        model.fit(X_train, y_train, sample_weight=sample_weights)
 
     return {
         "model": model,
         "params": {
             "layers": NEURAL_NET_LAYERS,
-            "dropout": NEURAL_NET_DROPOUT,
             "learning_rate": NEURAL_NET_LEARNING_RATE,
         },
         "name": "NeuralNet",
@@ -419,11 +444,13 @@ def save_all_models(models: dict[str, dict], feature_cols: list[str]):
 
     for name, model_dict in models.items():
         path = models_dir / f"{name.lower().replace(' ', '_')}.joblib"
-        joblib.dump(model_dict["model"], path)
+        joblib.dump(model_dict["model"], path, compress=3)
         logger.info(f"  Saved {name} to {path}")
 
-    joblib.dump(feature_cols, models_dir / "feature_columns.joblib")
-    logger.info(f"  Saved feature columns ({len(feature_cols)}) to {models_dir / 'feature_columns.joblib'}")
+    joblib.dump(feature_cols, models_dir / "feature_columns.joblib", compress=3)
+    logger.info(
+        f"  Saved feature columns ({len(feature_cols)}) to {models_dir / 'feature_columns.joblib'}"
+    )
 
 
 if __name__ == "__main__":
@@ -435,8 +462,16 @@ if __name__ == "__main__":
         df = df.dropna(subset=[TARGET_COLUMN])
 
         (
-            X_train, y_train, X_val, y_val, X_test, y_test,
-            feature_cols, train_df, val_df, test_df,
+            X_train,
+            y_train,
+            X_val,
+            y_val,
+            X_test,
+            y_test,
+            feature_cols,
+            train_df,
+            val_df,
+            test_df,
         ) = split_data(df)
 
         xgb = train_xgboost(X_train, y_train, X_val, y_val)
@@ -458,4 +493,7 @@ if __name__ == "__main__":
             if hasattr(model, "score"):
                 train_acc = model.score(X_train, y_train)
                 val_acc = model.score(X_val, y_val) if X_val is not None else None
-                logger.info(f"{name}: train_acc={train_acc:.4f}, val_acc={val_acc:.4f if val_acc else 'N/A'}")
+                logger.info(
+                    f"{name}: train_acc={train_acc:.4f}, "
+                    f"val_acc={val_acc:.4f if val_acc else 'N/A'}"
+                )

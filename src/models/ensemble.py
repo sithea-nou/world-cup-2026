@@ -1,18 +1,16 @@
 import warnings
-from pathlib import Path
 
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import StackingClassifier
-from sklearn.ensemble import VotingClassifier
+from sklearn.ensemble import StackingClassifier, VotingClassifier
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import KFold
 from sklearn.metrics import accuracy_score, log_loss
+from sklearn.model_selection import KFold
 from sklearn.preprocessing import label_binarize
 
-from src.config import CV_FOLDS, PROCESSED_DIR, RANDOM_STATE
+from src.config import PROCESSED_DIR, RANDOM_STATE
 from src.helpers import logger
 
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -122,7 +120,6 @@ def build_stacking_ensemble(
         solver="lbfgs",
         max_iter=1000,
         random_state=RANDOM_STATE,
-        class_weight="balanced",
     )
 
     stacking = StackingClassifier(
@@ -135,7 +132,11 @@ def build_stacking_ensemble(
 
     stacking.fit(X_train, y_train)
 
-    return {"model": stacking, "params": {"estimators": [e[0] for e in estimators]}, "name": "StackingEnsemble"}
+    return {
+        "model": stacking,
+        "params": {"estimators": [e[0] for e in estimators]},
+        "name": "StackingEnsemble",
+    }
 
 
 def build_voting_ensemble(
@@ -190,7 +191,11 @@ def calibrate_ensemble(
 
     calibrated_model = CalibratedWrapper(ensemble_model, isotonic_regressors, n_classes)
 
-    return {"model": calibrated_model, "params": {"calibration_method": method}, "name": f"CalibratedEnsemble_{method}"}
+    return {
+        "model": calibrated_model,
+        "params": {"calibration_method": method},
+        "name": f"CalibratedEnsemble_{method}",
+    }
 
 
 def _evaluate_ensemble(model, X_val: np.ndarray, y_val: np.ndarray) -> dict:
@@ -218,14 +223,19 @@ def build_best_ensemble(
         if hasattr(m, "predict"):
             candidates[name] = {"model": m, "name": name}
             metrics = _evaluate_ensemble(m, X_val, y_val)
-            logger.info(f"  {name} val_acc={metrics['accuracy']:.4f}, log_loss={metrics['log_loss']:.4f}")
+            logger.info(
+                f"  {name} val_acc={metrics['accuracy']:.4f}, log_loss={metrics['log_loss']:.4f}"
+            )
 
     # Soft-voting ensemble with uniform weights
     voting_uniform = build_voting_ensemble(models, X_train, y_train)
     if voting_uniform is not None:
         candidates[voting_uniform["name"]] = voting_uniform
         metrics = _evaluate_ensemble(voting_uniform["model"], X_val, y_val)
-        logger.info(f"  {voting_uniform['name']} val_acc={metrics['accuracy']:.4f}, log_loss={metrics['log_loss']:.4f}")
+        logger.info(
+            f"  {voting_uniform['name']} val_acc={metrics['accuracy']:.4f}, "
+            f"log_loss={metrics['log_loss']:.4f}"
+        )
 
     # Soft-voting ensemble with inverse-log-loss weights
     try:
@@ -246,7 +256,11 @@ def build_best_ensemble(
                 if voting_weighted is not None:
                     candidates["WeightedVotingEnsemble"] = voting_weighted
                     metrics = _evaluate_ensemble(voting_weighted["model"], X_val, y_val)
-                    logger.info(f"  {voting_weighted['name']} val_acc={metrics['accuracy']:.4f}, log_loss={metrics['log_loss']:.4f}")
+                    logger.info(
+                        f"  {voting_weighted['name']} val_acc="
+                        f"{metrics['accuracy']:.4f}, "
+                        f"log_loss={metrics['log_loss']:.4f}"
+                    )
     except Exception as e:
         logger.warning(f"  Weighted voting build failed: {e}")
 
@@ -255,7 +269,10 @@ def build_best_ensemble(
     if stacking is not None:
         candidates[stacking["name"]] = stacking
         metrics = _evaluate_ensemble(stacking["model"], X_val, y_val)
-        logger.info(f"  {stacking['name']} val_acc={metrics['accuracy']:.4f}, log_loss={metrics['log_loss']:.4f}")
+        logger.info(
+            f"  {stacking['name']} val_acc={metrics['accuracy']:.4f}, "
+            f"log_loss={metrics['log_loss']:.4f}"
+        )
 
     # Pick best by validation log_loss (lower is better); tie-break by higher accuracy
     best_name = None
@@ -276,12 +293,14 @@ def build_best_ensemble(
 
     best_model = candidates[best_name]["model"]
 
-    logger.info(f"  Selected best model: {best_name} (val_acc={best_acc:.4f}, log_loss={best_ll:.4f})")
+    logger.info(
+        f"  Selected best model: {best_name} (val_acc={best_acc:.4f}, log_loss={best_ll:.4f})"
+    )
 
     models_dir = PROCESSED_DIR / "models"
     models_dir.mkdir(parents=True, exist_ok=True)
     model_path = models_dir / "best_model.joblib"
-    joblib.dump(best_model, model_path)
+    joblib.dump(best_model, model_path, compress=3)
     logger.info(f"  Best ensemble saved to {model_path}")
 
     return {"model": best_model, "name": best_name}
@@ -293,12 +312,12 @@ def save_best_ensemble(ensemble_model, feature_cols: list[str]):
 
     model_path = models_dir / "best_model.joblib"
     if isinstance(ensemble_model, dict):
-        joblib.dump(ensemble_model["model"], model_path)
+        joblib.dump(ensemble_model["model"], model_path, compress=3)
     else:
-        joblib.dump(ensemble_model, model_path)
+        joblib.dump(ensemble_model, model_path, compress=3)
 
     feat_path = models_dir / "feature_columns.joblib"
-    joblib.dump(feature_cols, feat_path)
+    joblib.dump(feature_cols, feat_path, compress=3)
 
     logger.info(f"Best ensemble saved to {model_path}")
 
@@ -326,8 +345,19 @@ if __name__ == "__main__":
         df = df.dropna(subset=["outcome"])
 
         from src.models.train import split_data
-        (X_train, y_train, X_val, y_val, X_test, y_test,
-         feature_cols, train_df, val_df, test_df) = split_data(df)
+
+        (
+            X_train,
+            y_train,
+            X_val,
+            y_val,
+            X_test,
+            y_test,
+            feature_cols,
+            train_df,
+            val_df,
+            test_df,
+        ) = split_data(df)
 
         best = build_best_ensemble(models, X_train, y_train, X_val, y_val)
         logger.info(f"Best ensemble: {best['name']}")

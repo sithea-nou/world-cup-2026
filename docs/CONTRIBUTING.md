@@ -407,7 +407,7 @@ When modifying features, always increment `FEATURES_CACHE_VERSION` in `src/featu
 
 ### Simulation Model
 
-The default simulation model is XGBoost (loaded from `xgboost.joblib`), not the best ensemble. This is because XGBoost is faster for inference (6.6 MB model). The `WorldCupSimulator` class accepts a `model_name` parameter to specify which model file to load.
+The default simulation model is XGBoost (loaded from `xgboost.joblib`), not the best ensemble. This is because XGBoost is faster for inference (819KB compressed). The `WorldCupSimulator` class accepts a `model_name` parameter to specify which model file to load. Model files are compressed with `joblib.dump(..., compress=3)`; best_model.joblib is 96MB, randomforest.joblib is 47MB.
 
 ## PR Process
 

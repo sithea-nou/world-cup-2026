@@ -21,7 +21,7 @@ run_pipeline.py --all --n-simulations 1000
   Step 1: Data Scraping (Kaggle + Wikipedia + ESPN odds)
   Step 2: Feature Engineering (Elo, FIFA, form, H2H, SOS, EWM, draw features)
   Step 3: Model Training (XGBoost, RF, LogReg, NeuralNet)
-  Step 3b: Ensemble Building (StackingClassifier selected by log_loss)
+  Step 3b: Ensemble Building (WeightedVotingEnsemble selected by log_loss)
   Step 4: Evaluation (accuracy, log_loss, Brier, calibration)
   Step 5: Tournament Simulation (Monte Carlo, 1000 iterations, XGBoost model)
   Step 6: Visualization (power rankings, round probabilities, calibration)
@@ -49,7 +49,7 @@ worldcup/
 │   │   └── build_2026_features.py      # WC2026 match feature vectors
 │   ├── models/                  # Model training & evaluation
 │   │   ├── train.py                    # XGBoost, RF, LogReg, NeuralNet
-│   │   ├── ensemble.py                # StackingClassifier ensemble
+│   │   ├── ensemble.py                # WeightedVotingEnsemble ensemble
 │   │   ├── evaluate.py                 # Evaluation metrics & plots
 │   │   └── live_validation.py          # Validate against live results
 │   ├── simulation/              # Tournament simulation
@@ -95,11 +95,11 @@ worldcup/
 ### 3.3 Train/Validation/Test Split
 
 The dataset is split temporally to prevent data leakage:
-- **Training**: All matches before 2022
-- **Validation**: Matches from 2022 (including the 2022 World Cup, 64 matches)
-- **Test**: Matches after 2022
+- **Train**: All matches before 2023
+- **Validation**: Matches from 2023 (used for early stopping and ensemble selection)
+- **Test**: Matches after 2023
 
-The primary validation set (2022 World Cup) provides a realistic out-of-sample evaluation on high-stakes tournament matches.
+The primary validation set (2023 matches) provides a realistic out-of-sample evaluation, while the test set (post-2023) is held out for final evaluation.
 
 ---
 
@@ -169,19 +169,20 @@ Four base classifiers are trained:
 
 | Model | Hyperparameter Tuning | Key Configuration |
 |-------|----------------------|-------------------|
-| **XGBoost** | Optuna (30 trials, 5-fold TimeSeriesSplit CV, optimized for log_loss) | Draw class weight 4x; multi:softprob objective |
-| **Random Forest** | GridSearchCV (3-fold TimeSeriesSplit, scoring=neg_log_loss) | `class_weight="balanced"`; n_estimators ∈ {100,200,300} |
+| **XGBoost** | Optuna (20 trials, 3-fold TimeSeriesSplit CV, optimized for log_loss) | Draw class weight 4x (default); multi:softprob objective |
+| **Random Forest** | GridSearchCV (3-fold TimeSeriesSplit, scoring=neg_log_loss, class_weight="balanced") | `class_weight="balanced"`; n_estimators ∈ {100,200}; max_depth ∈ {10,20}; capped at 20 |
 | **Logistic Regression** | GridSearchCV (3-fold TimeSeriesSplit, scoring=neg_log_loss) | `class_weight="balanced"`; C ∈ {0.01,0.1,1.0,10.0}; StandardScaler pipeline |
-| **Neural Network (sklearn MLP)** | Early stopping (patience=10) | Layers [128,64,32]; alpha=0.001; batch_size=256; adaptive lr; max_iter=300; draw class weight 4x |
+| **Neural Network (sklearn MLP)** | Early stopping (patience=10) | Layers [128,64,32]; alpha=0.001; batch_size=256; adaptive lr; max_iter=300; draw class weight 8x |
 
 **Label encoding**: Home win → 2, Draw → 1, Away win → 0.
 
 **Missing values**: A `SimpleImputer(strategy="median")` is fit on training data and saved as `imputer.joblib` for use during simulation.
 
 **Draw handling**: Draws are the hardest class to predict. The pipeline uses multiple strategies:
-- XGBoost: 4x sample weight for draws (`{away_win: 1.0, draw: 4.0, home_win: 1.0}`)
+- XGBoost: 4x sample weight for draws (`{away_win: 1.0, draw: 4.0, home_win: 1.0}`, default)
+- NeuralNet: 8x sample weight for draws (`{away_win: 1.0, draw: 8.0, home_win: 1.0}`)
 - RF & LogReg: `class_weight="balanced"` for automatic rebalancing
-- Stacking meta-learner: `class_weight="balanced"` on LogisticRegression
+- WeightedVotingEnsemble meta-learner: uses inverse-log-loss weighted soft voting (no class_weight needed)
 - Draw-predictive features (elo_close, draw_tendency, fifa_close, tournament_draw_rate, combined_draw_prob)
 - `ELO_DRAW_FACTOR=0.30` in the Elo probability model
 - `WC_GROUP_DRAW_RATE=0.25` calibration in group stage simulation, boosting under-predicted draws toward the historical ~25% WC group-stage draw rate
@@ -196,8 +197,9 @@ The `build_best_ensemble` function evaluates multiple ensemble candidates on the
 2. **VotingEnsemble (uniform)**: Soft voting with equal weights
 3. **WeightedVotingEnsemble**: Soft voting with inverse-log-loss weights
 4. **StackingEnsemble**: LogisticRegression meta-learner over all base models (3-fold CV)
+5. **WeightedVotingEnsemble** (selected as best): Inverse-log-loss weighted soft voting (RF 0.293, LogReg 0.293, XGB 0.262, NN 0.152)
 
-The current best ensemble is a **StackingClassifier** with 4 base models and a LogisticRegression meta-learner with `class_weight="balanced"`, selected by validation log_loss.
+The WeightedVotingEnsemble was selected as the best model by validation log_loss.
 
 **Calibration**: Isotonic calibration via `CalibratedWrapper` was tested but removed because it degraded test performance (log_loss 0.8374 → 1.0436).
 
@@ -205,7 +207,7 @@ The current best ensemble is a **StackingClassifier** with 4 base models and a L
 
 The simulation uses Monte Carlo methods to estimate tournament advancement probabilities:
 
-1. **Model selection**: XGBoost is used as the default simulation model for speed (6.6 MB model, fast inference), though the ensemble can also be used.
+1. **Model selection**: XGBoost is used as the default simulation model for speed (819KB compressed model, fast inference), though the ensemble can also be used.
 
 2. **Group stage** (12 groups × 4 teams):
    - Each group's 6 round-robin matches are simulated by predicting win/draw/loss probabilities and sampling outcomes.
@@ -384,9 +386,9 @@ $$y = \begin{cases} 2 & \text{if } s_H > s_A \quad \text{(home win)} \\ 1 & \tex
 
 To address the class imbalance (draws are underrepresented at ~25%), a sample weight vector $\mathbf{w}$ is applied during training:
 
-$$w_i = \begin{cases} 1.0 & \text{if } y_i = 0 \quad \text{(away win)} \\ 4.0 & \text{if } y_i = 1 \quad \text{(draw)} \\ 1.0 & \text{if } y_i = 2 \quad \text{(home win)} \end{cases}$$
+$$w_i = \begin{cases} 1.0 & \text{if } y_i = 0 \quad \text{(away win)} \\ 4.0 \text{ or } 8.0 & \text{if } y_i = 1 \quad \text{(draw)} \\ 1.0 & \text{if } y_i = 2 \quad \text{(home win)} \end{cases}$$
 
-This is applied to XGBoost and NeuralNet via the `sample_weight` parameter. Random Forest, Logistic Regression, and the Stacking ensemble meta-learner use `class_weight="balanced"`, which computes class weights inversely proportional to class frequencies:
+This is applied to XGBoost (4x) and NeuralNet (8x) via the `sample_weight` parameter. Random Forest and Logistic Regression use `class_weight="balanced"`, which computes class weights inversely proportional to class frequencies. The WeightedVotingEnsemble does NOT use class_weight on its meta-learner.
 
 $$w_c = \frac{n}{n_c \cdot C}$$
 
@@ -398,7 +400,7 @@ XGBoost minimizes the multi-class logistic loss (cross-entropy) with regularizat
 
 $$\mathcal{L}(\theta) = \sum_{i=1}^{n} w_i \cdot \text{CE}(y_i, \hat{\mathbf{p}}_i) + \sum_{k=1}^{K} \left[ \gamma T_k + \frac{\lambda}{2} \|\mathbf{f}_k\|^2 \right]$$
 
-where CE is the cross-entropy loss, $T_k$ is the number of leaves in tree $k$, $\gamma$ is the leaf penalty, and $\lambda$ is the L2 regularization. Hyperparameters are tuned via Optuna (30 trials, 5-fold TimeSeriesSplit CV) optimizing for log-loss.
+where CE is the cross-entropy loss, $T_k$ is the number of leaves in tree $k$, $\gamma$ is the leaf penalty, and $\lambda$ is the L2 regularization. Hyperparameters are tuned via Optuna (20 trials, 3-fold TimeSeriesSplit CV) optimizing for log-loss.
 
 #### 5.3.4 Random Forest
 
@@ -406,7 +408,7 @@ Random Forest fits $B$ decision trees on bootstrapped samples with random featur
 
 $$\hat{P}(y = c \mid \mathbf{x}) = \frac{1}{B} \sum_{b=1}^{B} \mathbb{1}[\text{tree}_b(\mathbf{x}) = c]$$
 
-Hyperparameters are tuned via GridSearchCV (3-fold TimeSeriesSplit, scoring=neg_log_loss): `n_estimators` ∈ {100, 200, 300}, `max_depth` ∈ {10, 20, None}, `min_samples_split` ∈ {2, 5}, `class_weight="balanced"`.
+Hyperparameters are tuned via GridSearchCV (3-fold TimeSeriesSplit, scoring=neg_log_loss): `n_estimators` ∈ {100, 200}, `max_depth` ∈ {10, 20} (capped at 20), `min_samples_split` ∈ {2, 5}, `class_weight="balanced"`.
 
 #### 5.3.5 Logistic Regression
 
@@ -422,17 +424,17 @@ A feedforward neural network with architecture:
 
 $$\mathbb{R}^{80} \xrightarrow{W_1, b_1} \mathbb{R}^{128} \xrightarrow{\text{ReLU}} \mathbb{R}^{64} \xrightarrow{\text{ReLU}} \mathbb{R}^{32} \xrightarrow{\text{ReLU}} \mathbb{R}^{3} \xrightarrow{\text{softmax}} \mathbb{R}^{3}$$
 
-Configuration: Adam optimizer with adaptive learning rate (initial $\eta = 10^{-3}$), L2 regularization $\alpha = 0.001$, batch size 256, maximum 300 iterations, early stopping with patience 10. Draw samples receive 4x weight as in XGBoost.
+Configuration: Adam optimizer with adaptive learning rate (initial $\eta = 10^{-3}$), L2 regularization $\alpha = 0.001$, batch size 256, maximum 300 iterations, early stopping with patience 10. Draw samples receive 8x weight (overriding the default 4x from `_compute_sample_weights`).
 
-#### 5.3.7 Stacking Ensemble
+#### 5.3.7 WeightedVotingEnsemble
 
-The final model is a StackingClassifier with 4 base learners and a LogisticRegression meta-learner:
+The final model is a WeightedVotingEnsemble with 4 base learners using inverse-log-loss weighted soft voting:
 
-$$\hat{P}_\text{stack}(y = c \mid \mathbf{x}) = \sigma\left(\mathbf{w}_c^T \boldsymbol{\phi}(\mathbf{x}) + b_c\right)$$
+$$\hat{P}_\text{wv}(y = c \mid \mathbf{x}) = \sum_{m=1}^{M} \alpha_m \cdot \hat{P}_m(y = c \mid \mathbf{x})$$
 
-where $\boldsymbol{\phi}(\mathbf{x}) = [\hat{P}_\text{XGB}(y=c \mid \mathbf{x}), \; \hat{P}_\text{RF}(y=c \mid \mathbf{x}), \; \hat{P}_\text{LR}(y=c \mid \mathbf{x}), \; \hat{P}_\text{MLP}(y=c \mid \mathbf{x})]_{c \in \{0,1,2\}}$ is the 12-dimensional vector of base model probabilities, and $\sigma$ is the softmax function.
+where $\alpha_m = \frac{1/\text{LL}_m}{\sum_{m'} 1/\text{LL}_{m'}}$ and $\text{LL}_m$ is the validation log-loss of model $m$. The weights are: RF 0.293, LogReg 0.293, XGB 0.262, NN 0.152.
 
-The meta-learner is trained via 3-fold cross-validation on the training set, using `predict_proba` as the stacking method. Ensemble selection is performed by choosing the candidate with the lowest validation log-loss.
+Ensemble selection is performed by choosing the candidate with the lowest validation log-loss.
 
 #### 5.3.8 Ensemble Candidate Selection
 
@@ -441,7 +443,9 @@ Four ensemble types are evaluated on the validation set:
 1. **Individual models**: Each base model evaluated independently
 2. **VotingEnsemble (uniform)**: $\hat{P}(y=c \mid \mathbf{x}) = \frac{1}{M} \sum_{m=1}^{M} \hat{P}_m(y=c \mid \mathbf{x})$
 3. **WeightedVotingEnsemble**: $\hat{P}(y=c \mid \mathbf{x}) = \sum_{m=1}^{M} \alpha_m \hat{P}_m(y=c \mid \mathbf{x})$, where $\alpha_m = \frac{1/\text{LL}_m}{\sum_{m'} 1/\text{LL}_{m'}}$ and $\text{LL}_m$ is the validation log-loss of model $m$
-4. **StackingEnsemble**: LogisticRegression meta-learner (described above)
+4. **StackingEnsemble**: LogisticRegression meta-learner over all base models using `predict_proba`
+
+### WeightedVotingEnsemble Details
 
 The candidate with the lowest validation log-loss is selected as the final model.
 
@@ -569,26 +573,25 @@ where $\tilde{x}_j$ is the median of feature $j$ across the training set. This r
 
 | Model | Accuracy | Log Loss |
 |-------|----------|----------|
-| **BestEnsemble (Stacking)** | **0.620** | **0.836** |
-| RandomForest | 0.606 | 0.859 |
-| LogisticRegression | 0.570 | 0.878 |
-| XGBoost | 0.552 | 0.918 |
-| NeuralNet (MLP) | 0.597 | 1.172 |
+| **BestEnsemble (WeightedVotingEnsemble)** | **0.6148** | **0.8352** |
+| RandomForest | 0.5933 | 0.8573 |
+| LogisticRegression | 0.5792 | 0.8739 |
+| XGBoost | 0.5047 | 0.9553 |
+| NeuralNet (MLP) | 0.3589 | 1.7322 |
 
-The StackingClassifier ensemble achieves the best log_loss, confirming that combining diverse model types improves calibration. The ensemble meta-learner uses `class_weight="balanced"` to handle draw class imbalance.
+The WeightedVotingEnsemble achieves the best log_loss, confirming that combining diverse model types with inverse-log-loss weighting improves calibration. The ensemble uses soft voting with weights proportional to each model's inverse log-loss: RF 0.293, LogReg 0.293, XGB 0.262, NN 0.152.
 
 **Key Draw Stats:**
-- XGBoost: pred_draws=1344, actual_draws=830 on test set (over-predicts with 4x weight)
-- BestEnsemble: pred_draws=171, actual_draws=830 (under-predicts)
+- XGBoost: over-predicts draws with 4x weight (still better calibrated than without weight)
+- BestEnsemble: under-predicts draws (argmax rarely picks draw)
 - Draw calibration in the simulator (WC_GROUP_DRAW_RATE=0.25) fixes this for WC predictions
+- 5 actual draws in WC2026 were all missed by argmax (Canada-BIH, Qatar-SUI, Brazil-MAR, Netherlands-JPN, Spain-CPV)
 
-### 6.1b Live Validation (WC 2026, 10 matches)
+### 6.1b Live Validation (WC 2026, 13 matches)
 
-| Model | Accuracy | Log Loss |
-|-------|----------|----------|
-| BestEnsemble | 40% (4/10) | 1.059 |
-| XGBoost | 40% (4/10) | 1.001 |
-| RandomForest | 30% (3/10) | 0.974 |
+| Model | Accuracy (argmax) | Log Loss |
+|-------|-------------------|----------|
+| WeightedVotingEnsemble | 46.2% (6/13) | 1.05 |
 
 ### 6.2 Validation on 2022 World Cup (64 matches)
 
@@ -599,7 +602,7 @@ The StackingClassifier ensemble achieves the best log_loss, confirming that comb
 | Avg Brier | 0.1913 | **0.1657** |
 
 The improvements come from:
-- Draw class weighting (4x for XGBoost/NeuralNet, `class_weight="balanced"` for RF/LogReg and meta-learner)
+- Draw class weighting (4x for XGBoost, 8x for NeuralNet, `class_weight="balanced"` for RF/LogReg, no class_weight on meta-learner)
 - `ELO_DRAW_FACTOR=0.30` (increased from 0.25)
 - Draw-predictive features (`elo_close`, `draw_tendency`, `fifa_close`, `tournament_draw_rate`, `combined_draw_prob`)
 - Squad quality features (8 new features from Transfermarkt data)
@@ -612,23 +615,24 @@ The improvements come from:
 
 | Rank | Team | Win Prob |
 |------|------|----------|
-| 1 | Mexico | 7.6% |
-| 2 | Switzerland | 6.5% |
-| 3 | United States | 6.0% |
-| 4 | Germany | 4.8% |
-| 5 | Canada | 4.7% |
+| 1 | Mexico | 7.9% |
+| 2 | Switzerland | 5.6% |
+| 3 | United States | 5.1% |
+| 4 | Ivory Coast | 4.8% |
+| 5 | France | 4.6% |
 
 Notable observations:
 - **Mexico and Canada** benefit from host-nation home advantage (the 2026 WC is hosted by US/CA/MX), reflected in their elevated probabilities.
-- **Switzerland's** high probability (5.2%) suggests a favorable group draw and bracket path.
+- **Switzerland's** high probability (5.6%) suggests a favorable group draw and bracket path.
 - **Argentina** and **France**, despite being traditional powerhouses, have lower advancement probabilities from the group stage (~50%) due to potentially harder group composition in the simulation.
-- **Spain** has the highest R32 probability (97.2%) but lower overall winning probability (2.9%), suggesting easier group but tougher knockout path.
+- **Ivory Coast** (4.8%) emerges as a strong contender, possibly benefiting from favorable group placement.
+- **Spain** has the highest R32 probability (97.2%) but lower overall winning probability, suggesting easier group but tougher knockout path.
 
 ### 6.4 Confederation Strength Analysis
 
 The simulation reveals significant disparities in confederation-level performance, reflecting both the quality depth within each confederation and the structural advantages conferred by the expanded 48-team format. The addition of Transfermarkt squad quality features provides a direct measure of team quality that complements Elo and FIFA rankings.
 
-> Note: The detailed confederation percentages below are from a previous simulation run. The updated top 5 tournament win probabilities are: Mexico 7.6%, Switzerland 6.5%, USA 6.0%, Germany 4.8%, Canada 4.7%.
+> Note: The detailed confederation percentages below are from a previous simulation run. The updated top 5 tournament win probabilities are: Mexico 7.9%, Switzerland 5.6%, USA 5.1%, Ivory Coast 4.8%, France 4.6%.
 
 | Confederation | Teams | Avg Win % | Avg Ro16 % | Avg QF % | Best Team | Best Win % |
 |---------------|-------|-----------|------------|----------|-----------|------------|
@@ -648,21 +652,21 @@ Key takeaways:
 
 ### 6.5 Host Nation Advantage Analysis
 
-The 2026 World Cup's tri-host format (Mexico, Canada, United States) creates a unique home-advantage dynamic. The simulation explicitly models this through the `is_host_nation` and `home_advantage` features, which assign full home advantage when a host plays on home soil and neutral venue designation for all other matches. The combined effect is substantial: the three host nations together account for approximately 15.9% of total tournament win probability, a figure that far exceeds what their FIFA rankings alone would predict.
+The 2026 World Cup's tri-host format (Mexico, Canada, United States) creates a unique home-advantage dynamic. The simulation explicitly models this through the `is_host_nation` and `home_advantage` features, which assign full home advantage when a host plays on home soil and neutral venue designation for all other matches. The combined effect is substantial: the three host nations together account for approximately 17.3% of total tournament win probability, a figure that far exceeds what their FIFA rankings alone would predict.
 
 | Host Nation | Win % | Final % | SF % | QF % | Ro16 % |
 |-------------|-------|---------|------|------|--------|
-| Mexico | 7.6 | — | — | — | — |
-| United States | 6.0 | — | — | — | — |
-| Canada | 4.7 | — | — | — | — |
-| **Combined** | **18.3** | — | — | — | — |
+| Mexico | 7.9 | — | — | — | — |
+| United States | 5.1 | — | — | — | — |
+| Canada | — | — | — | — | — |
+| **Combined** | **17.3** | — | — | — | — |
 
 Key takeaways:
 
-- **Mexico's position as the top overall pick** (7.6%) is almost entirely a function of home advantage. Without it, Mexico's Elo and FIFA rankings would place it well outside the top 5. Home advantage adds +100 Elo points and `home_advantage=1.0` for host matches.
-- **The United States at 6.0%** benefits from host advantage, though it faces competitive group opposition.
-- **Canada at 4.7%** also benefits from home advantage, pushing it into the top 5 despite not being a traditional power.
-- **Combined host probability of 18.3%** is remarkable: three teams that would collectively account for perhaps 5–7% without home advantage instead capture nearly 1 in 5 simulation wins. This illustrates the outsized structural impact of host-nation status in the expanded 48-team format.
+- **Mexico's position as the top overall pick** (7.9%) is almost entirely a function of home advantage. Without it, Mexico's Elo and FIFA rankings would place it well outside the top 5. Home advantage adds +100 Elo points and `home_advantage=1.0` for host matches.
+- **The United States at 5.1%** benefits from host advantage, though it faces competitive group opposition.
+- **Canada** also benefits from home advantage, though less than expected given its ranking.
+- **Combined host probability of 17.3%** is remarkable: three teams that would collectively account for perhaps 5–7% without home advantage instead capture nearly 1 in 6 simulation wins. This illustrates the outsized structural impact of host-nation status in the expanded 48-team format.
 
 ### 6.6 Draw Prediction Analysis
 
@@ -700,7 +704,7 @@ Key takeaways:
 
 Traditional World Cup analysis focuses on UEFA and CONMEBOL favorites, but the simulation reveals several teams from other confederations with surprisingly high advancement and tournament-winning probabilities. These "dark horses" benefit from favorable group draws, host advantage, or recent form improvements that the model captures through Elo, FIFA ranking, form, and squad quality features.
 
-> Note: The detailed advancement percentages below are from a previous simulation run. The updated top 5 tournament win probabilities are: Mexico 7.6%, Switzerland 6.5%, USA 6.0%, Germany 4.8%, Canada 4.7%.
+> Note: The detailed advancement percentages below are from a previous simulation run. The updated top 5 tournament win probabilities are: Mexico 7.9%, Switzerland 5.6%, USA 5.1%, Ivory Coast 4.8%, France 4.6%.
 
 | Rank | Team | Win % | Advance % | 1st in Group % | Confederation |
 |------|------|-------|-----------|----------------|---------------|
@@ -718,8 +722,8 @@ Traditional World Cup analysis focuses on UEFA and CONMEBOL favorites, but the s
 Key takeaways:
 
 - **Morocco (3.6%)** is the strongest non-host dark horse.
-- **Canada (4.7%) and Mexico (7.6%) dominate this list** due to host advantage, with high group-stage advancement probabilities.
-- **Switzerland (6.5%)** benefits from a favorable group draw and strong recent Elo form.
+- **Mexico (7.9%) dominates** due to host advantage, with high group-stage advancement probability.
+- **Switzerland (5.6%)** benefits from a favorable group draw and strong recent Elo form.
 
 ### 6.8 Most Competitive Groups
 
@@ -780,11 +784,11 @@ Comparing the model's tournament-winning probabilities with implied probabilitie
 
 | Team | Model % | Odds % | Difference |
 |------|---------|--------|------------|
-| Mexico | 7.6 | 3.6 | +4.0 |
-| Switzerland | 6.5 | 3.0 | +3.5 |
-| United States | 6.0 | 3.3 | +2.7 |
-| Germany | 4.8 | — | — |
-| Brazil | — | 7.5 | — |
+| Mexico | 7.9 | 3.6 | +4.3 |
+| Switzerland | 5.6 | 3.0 | +2.6 |
+| United States | 5.1 | 3.3 | +1.8 |
+| Ivory Coast | 4.8 | — | — |
+| France | 4.6 | 9.1 | -4.5 |
 | England | — | 7.3 | — |
 | France | — | 9.1 | — |
 | Argentina | — | 9.4 | — |
@@ -793,20 +797,20 @@ Comparing the model's tournament-winning probabilities with implied probabilitie
 Key takeaways:
 
 - **The biggest divergences remain with traditional powers**: Argentina, France, Spain, and England are all significantly undervalued by the model relative to odds. The model's Elo/FIFA-based features may not fully capture squad quality, though the new Transfermarkt features partially address this.
-- **Mexico (+4.0%) and Switzerland (+3.5%)** are the most overvalued teams relative to odds. Mexico's overvaluation is almost entirely attributable to home advantage. Switzerland's overvaluation likely reflects a combination of a favorable group draw and strong recent Elo form.
+- **Mexico (+4.3%) and Switzerland (+2.6%)** are the most overvalued teams relative to odds. Mexico's overvaluation is almost entirely attributable to home advantage. Switzerland's overvaluation likely reflects a combination of a favorable group draw and strong recent Elo form.
 - **The model systematically favors host-related advantages and Elo-based depth over star power and market sentiment.** Bettors could use these divergences to identify potential value bets — specifically, backing traditional powers like Spain, Argentina, and France at market odds may offer positive expected value if the model's analysis is correct.
 
 ### 6.12 Simulation Summary
 
 Across 1,000 Monte Carlo simulations of the 2026 FIFA World Cup using the XGBoost model, the following high-level conclusions emerge:
 
-1. **No dominant favorite**: The tournament win probability is remarkably flat. Mexico leads at 7.6%, but the top 5 teams collectively account for only ~30% of total win probability. This parity reflects the expanded 48-team format and the inherent randomness of knockout football.
+1. **No dominant favorite**: The tournament win probability is remarkably flat. Mexico leads at 7.9%, but the top 5 teams collectively account for only ~28% of total win probability. This parity reflects the expanded 48-team format and the inherent randomness of knockout football.
 
-2. **Host advantage is the single largest structural factor**: The three host nations (Mexico, Canada, United States) combine for ~18.3% win probability — more than any single confederation outside UEFA. Without home advantage, these teams would likely rank significantly lower.
+2. **Host advantage is the single largest structural factor**: The three host nations (Mexico, Canada, United States) combine for ~17.3% win probability — more than any single confederation outside UEFA. Without home advantage, these teams would likely rank significantly lower.
 
 3. **Squad quality matters**: The Transfermarkt squad quality features provide direct signals for team quality that Elo and FIFA rankings alone don't capture. France (€1.52B), England (€1.36B), and Spain (€1.22B) have the highest squad values, which influences knockout stage predictions.
 
-4. **Draws remain challenging**: The BestEnsemble under-predicts draws (171 predicted vs 830 actual), while XGBoost over-predicts (1344 vs 830). WC group-stage draw calibration (`WC_GROUP_DRAW_RATE=0.25`) addresses this for simulation.
+4. **Draws remain challenging**: The WeightedVotingEnsemble under-predicts draws (argmax rarely picks draw), while XGBoost over-predicts. WC group-stage draw calibration (`WC_GROUP_DRAW_RATE=0.25`) addresses this for simulation. In WC2026 live validation, 5 actual draws were all missed (Canada-BIH, Qatar-SUI, Brazil-MAR, Netherlands-JPN, Spain-CPV).
 
 5. **The model diverges meaningfully from betting markets**: The systematic undervaluation of traditional powers and overvaluation of hosts and structurally advantaged teams creates potential arbitrage opportunities. The new squad quality features partially address this.
 
@@ -816,11 +820,11 @@ Across 1,000 Monte Carlo simulations of the 2026 FIFA World Cup using the XGBoos
 
 ### 6.13 Key Design Decisions & Trade-offs
 
-1. **XGBoost for simulation**: While the StackingClassifier is the best model, XGBoost is used for simulation due to its much faster inference speed (6.6 MB model vs. ensemble with 4 models + meta-learner). The performance gap on validation data is small.
+1. **XGBoost for simulation**: While the WeightedVotingEnsemble is the best model, XGBoost is used for simulation due to its much faster inference speed (819KB compressed vs. ensemble at 96MB). The performance gap on validation data is small.
 
 2. **Log_loss as selection metric**: Models and ensembles are selected by log_loss rather than accuracy, because well-calibrated probability estimates are more important for simulation than raw classification accuracy.
 
-3. **Draw class weighting (4x)**: Draws are the minority class in football (~25% of outcomes). The 4x weight improves draw recall, though XGBoost still over-predicts draws (1344 predicted vs 830 actual). The Stacking ensemble meta-learner also uses `class_weight="balanced"` to handle draw imbalance.
+3. **Draw class weighting**: Draws are the minority class in football (~25% of outcomes). XGBoost uses 4x draw weight, NeuralNet uses 8x draw weight. RF and LogReg use `class_weight="balanced"`. The WeightedVotingEnsemble meta-learner does NOT use class_weight.
 
 4. **Neutral venue handling**: WC2026 matches in the US/CA/MX are correctly flagged as neutral except when the host nation plays, where they receive full home advantage.
 
@@ -830,30 +834,29 @@ Across 1,000 Monte Carlo simulations of the 2026 FIFA World Cup using the XGBoos
 
 ## 7. Conclusion
 
-This project demonstrates a complete end-to-end machine learning pipeline for predicting World Cup outcomes, from data collection through simulation and visualization. The StackingClassifier ensemble achieves 62.0% accuracy and 0.836 log_loss on the test set, with a 59.38% accuracy on the 2022 World Cup validation set. The Monte Carlo simulation produces actionable tournament probability estimates, with host nations (Mexico, Canada, USA) showing elevated advancement probabilities due to home advantage.
+This project demonstrates a complete end-to-end machine learning pipeline for predicting World Cup outcomes, from data collection through simulation and visualization. The WeightedVotingEnsemble achieves 61.48% accuracy and 0.8352 log_loss on the test set, with a 59.38% accuracy on the 2022 World Cup validation set. The Monte Carlo simulation produces actionable tournament probability estimates, with host nations (Mexico, Canada, USA) showing elevated advancement probabilities due to home advantage.
 
 Key strengths of the approach include:
 - **Comprehensive feature engineering**: 80 features spanning Elo ratings, FIFA rankings, team form, head-to-head records, draw-predictive signals, and Transfermarkt squad quality data.
-- **Multi-model ensemble**: Combining diverse classifier types (gradient boosting, random forest, logistic regression, neural network) with a balanced meta-learner improves robustness.
-- **Draw handling**: Multiple strategies specifically target the difficult draw class, including 4x class weighting, balanced meta-learner, draw-predictive features, Elo draw modeling, and WC group-stage draw calibration.
+- **Multi-model ensemble**: Combining diverse classifier types (gradient boosting, random forest, logistic regression, neural network) via inverse-log-loss weighted soft voting (WeightedVotingEnsemble) improves robustness.
+- **Draw handling**: Multiple strategies specifically target the difficult draw class, including 4x class weighting for XGBoost, 8x for NeuralNet, `class_weight="balanced"` for RF/LogReg, no class_weight on the meta-learner, draw-predictive features, Elo draw modeling, and WC group-stage draw calibration.
 - **Fixture swap fix**: Correct probability perspective when match lookups use reversed fixture ordering.
 - **Squad quality features**: Transfermarkt market value data provides a direct signal for team quality that complements Elo and FIFA rankings.
 - **Draw calibration**: WC group-stage draw rate calibration ensures realistic simulation outcomes.
-- **Fixture swap fix**: Correct probability perspective when match lookups use reversed fixture ordering.
 - **Reproducibility**: Feature caching with content hashing (version "7"), deterministic random seeds, and a single CLI orchestrator.
-- **Live validation**: The pipeline supports incremental validation as the tournament progresses.
+- **Live validation**: The pipeline supports incremental validation as the tournament progresses, with both argmax and draw-threshold accuracy metrics.
 
 The expanded analytical insights from the simulation reveal several important findings:
 - **Confederation-level analysis** shows that UEFA provides the most consistent depth, while CONCACAF's apparent strength is driven by the three host nations.
-- **Host nation advantage** is the single largest structural factor in the tournament, accounting for approximately 18.3% of combined win probability for Mexico, Canada, and the United States — a figure that far exceeds what their underlying quality would predict.
-- **Draw predictions** highlight the challenge of the draw class: the BestEnsemble under-predicts draws (171 predicted vs 830 actual), while XGBoost with 4x draw weight over-predicts (1344 predicted vs 830 actual). WC group-stage draw calibration (`WC_GROUP_DRAW_RATE=0.25`) addresses this for simulation.
-- **Dark horse analysis** identifies Switzerland (6.5%), Morocco, and Japan as strong non-traditional contenders benefiting from favorable group draws and recent form.
+- **Host nation advantage** is the single largest structural factor in the tournament, accounting for approximately 17.3% of combined win probability for Mexico, Canada, and the United States — a figure that far exceeds what their underlying quality would predict.
+- **Draw predictions** highlight the challenge of the draw class: the WeightedVotingEnsemble under-predicts draws (argmax rarely picks draw), while XGBoost with 4x draw weight still over-predicts. WC group-stage draw calibration (`WC_GROUP_DRAW_RATE=0.25`) addresses this for simulation. In live WC2026 validation, 5 actual draws were all missed (Canada-BIH, Qatar-SUI, Brazil-MAR, Netherlands-JPN, Spain-CPV).
+- **Dark horse analysis** identifies Switzerland (5.6%), Morocco, and Japan as strong non-traditional contenders benefiting from favorable group draws and recent form.
 - **Model vs. odds comparison** reveals systematic divergences: the model overvalues hosts and structurally advantaged teams while undervaluing traditional powers, creating potential arbitrage opportunities.
 - **Group competitiveness analysis** identifies Group D as the tightest group, making it the most unpredictable pool.
 
 Limitations:
-- The test set after 2022 may be small, making generalization uncertain.
-- The simulation model (XGBoost) differs from the best overall model (StackingClassifier), introducing a potential accuracy-speed trade-off.
+- The test set after 2023 may be small, making generalization uncertain.
+- The simulation model (XGBoost) differs from the best overall model (WeightedVotingEnsemble), introducing a potential accuracy-speed trade-off.
 - Bookmaker odds are only available for WC2026 matches, limiting their training utility.
 - The expanded 48-team, 12-group format has no historical precedent, making group and bracket path estimation inherently uncertain.
 - The model diverges meaningfully from betting markets on traditional powers (Spain, Argentina, France), which may reflect limitations in Elo/FIFA-based features that do not fully capture squad quality and tactical sophistication. The new Transfermarkt squad quality features partially address this.

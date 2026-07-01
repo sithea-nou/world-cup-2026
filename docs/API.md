@@ -95,15 +95,15 @@ All configuration constants are module-level variables in `src/config.py`.
 | `NEURAL_NET_EPOCHS` | `int` | 100 | Max training iterations (overridden to 300 in `_build_sklearn_mlp`) |
 | `NEURAL_NET_PATIENCE` | `int` | 10 | Early stopping patience |
 | `NEURAL_NET_LAYERS` | `list[int]` | `[128, 64, 32]` | Hidden layer sizes |
-| `NEURAL_NET_DROPOUT` | `float` | 0.3 | Not used (sklearn MLP uses alpha) |
+| `NEURAL_NET_DROPOUT` | `float` | 0.3 | Not used (sklearn MLP uses alpha); import removed from train.py |
 | `NEURAL_NET_LEARNING_RATE` | `float` | 1e-3 | Initial learning rate |
 
 ### Hyperparameter Tuning
 
 | Constant | Type | Default | Description |
 |----------|------|---------|-------------|
-| `OPTUNA_TRIALS` | `int` | 100 | Number of Optuna trials (capped at 30 in practice) |
-| `CV_FOLDS` | `int` | 5 | Cross-validation folds |
+| `OPTUNA_TRIALS` | `int` | 20 | Number of Optuna hyperparameter trials |
+| `CV_FOLDS` | `int` | 3 | Cross-validation folds |
 
 ### Outcome Encoding
 
@@ -580,16 +580,16 @@ Total: 80 features when all are present.
 def _compute_sample_weights(y_train) -> np.ndarray
 ```
 
-Computes sample weights for class imbalance. Draw class (label 1) receives 4.0x weight; home win (2) and away win (0) receive 1.0x.
+Computes sample weights for class imbalance. Draw class (label 1) receives 4.0x weight by default (used by XGBoost); NeuralNet overrides to 8.0x via `_compute_sample_weights(y_train, draw_weight=8.0)`. Home win (2) and away win (0) receive 1.0x. RF/LogReg use `class_weight="balanced"` instead of sample weights.
 
 **Returns:** Array of sample weights aligned with `y_train`
 
-#### `split_data(df: pd.DataFrame, test_year: int = 2022, val_years: list[int] | None = None) -> tuple`
+#### `split_data(df: pd.DataFrame, test_year: int = 2023, val_years: list[int] | None = None) -> tuple`
 
 ```python
 def split_data(
     df: pd.DataFrame,
-    test_year: int = 2022,
+    test_year: int = 2023,
     val_years: list[int] | None = None,
 ) -> tuple[
     np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
@@ -597,7 +597,7 @@ def split_data(
 ]
 ```
 
-Splits match features into train/validation/test sets by year. Default: train < 2022, val = 2022, test > 2022. Maps outcomes to `{1: 2, 0: 1, -1: 0}` for scikit-learn. Applies `SimpleImputer(strategy="median")` to fill missing values and saves the fitted imputer to `data/processed/models/imputer.joblib`.
+Splits match features into train/validation/test sets by year. Default: train < 2023, val = 2023, test > 2023. Maps outcomes to `{1: 2, 0: 1, -1: 0}` for scikit-learn. Applies `SimpleImputer(strategy="median")` to fill missing values and saves the fitted imputer to `data/processed/models/imputer.joblib` (with `compress=3`).
 
 **Returns:** `(X_train, y_train, X_val, y_val, X_test, y_test, feature_cols, train_df, val_df, test_df)`
 
@@ -612,7 +612,7 @@ def train_xgboost(
 ) -> dict
 ```
 
-Trains an XGBClassifier with Optuna hyperparameter optimization. Optimizes for **log_loss** (not accuracy). Uses 4x sample weight for draw class. Uses validation set for early stopping if provided; otherwise uses TimeSeriesSplit cross-validation. Capped at 30 Optuna trials.
+Trains an XGBClassifier with Optuna hyperparameter optimization. Optimizes for **log_loss** (not accuracy). Uses 4x sample weight for draw class (default from `_compute_sample_weights`). Uses validation set for early stopping if provided; otherwise uses TimeSeriesSplit cross-validation. Optuna capped at 20 trials with 3-fold CV.
 
 **Returns:** `{"model": XGBClassifier, "params": dict, "name": "XGBoost"}`
 
@@ -622,7 +622,7 @@ Trains an XGBClassifier with Optuna hyperparameter optimization. Optimizes for *
 def train_random_forest(X_train: np.ndarray, y_train: np.ndarray) -> dict
 ```
 
-Trains a RandomForestClassifier with grid search over hyperparameters using 3-fold TimeSeriesSplit. Optimizes for `neg_log_loss` with `class_weight="balanced"`. Searches `n_estimators=[100,200,300]`, `max_depth=[10,20,None]`, `min_samples_split=[2,5]`.
+Trains a RandomForestClassifier with grid search over hyperparameters using 3-fold TimeSeriesSplit. Optimizes for `neg_log_loss` with `class_weight="balanced"`. Searches `n_estimators=[100,200]`, `max_depth=[10,20]` (capped at 20), `min_samples_split=[2,5]`.
 
 **Returns:** `{"model": RandomForestClassifier, "params": dict, "name": "RandomForest"}`
 
@@ -657,7 +657,7 @@ def train_neural_net(
 ) -> dict
 ```
 
-Trains an sklearn MLPClassifier (3-layer: 128-64-32) with alpha=0.001, batch_size=256, adaptive learning rate, max_iter=300, and early stopping with patience=10. Uses 4x sample weight for draw class. If validation data is provided, combines train+val for final fit.
+Trains an sklearn MLPClassifier (3-layer: 128-64-32) with alpha=0.001, batch_size=256, adaptive learning rate, max_iter=300, and early stopping with patience=10. Uses 8x sample weight for draw class. If validation data is provided, combines train+val for final fit.
 
 **Returns:** `{"model": MLPClassifier, "params": dict, "name": "NeuralNet"}`
 
@@ -667,7 +667,7 @@ Trains an sklearn MLPClassifier (3-layer: 128-64-32) with alpha=0.001, batch_siz
 def save_all_models(models: dict[str, dict], feature_cols: list[str]) -> None
 ```
 
-Saves all models to `data/processed/models/` as Joblib files and feature columns as `feature_columns.joblib`.
+Saves all models to `data/processed/models/` as Joblib files (with `compress=3`) and feature columns as `feature_columns.joblib`.
 
 ---
 
@@ -703,7 +703,7 @@ def build_stacking_ensemble(
 ) -> dict
 ```
 
-Builds a StackingClassifier with LogisticRegression meta-learner using `class_weight="balanced"`. Only includes models that implement `predict_proba`. Uses `KFold(n_splits=3, shuffle=True)` for cross-validated stacking.
+Builds a StackingClassifier with LogisticRegression meta-learner (no class_weight). Only includes models that implement `predict_proba`. Uses `KFold(n_splits=3, shuffle=True)` for cross-validated stacking.
 
 **Parameters:**
 - `models` -- Dict of model dicts (each with `"model"` key)
@@ -761,7 +761,7 @@ Builds and selects the best ensemble by evaluating multiple candidates on valida
 5. Selects the candidate with the lowest validation log_loss
 6. Saves the best model to `data/processed/models/best_model.joblib`
 
-The current best ensemble is a StackingClassifier with 4 base models (XGBoost, RandomForest, LogisticRegression, NeuralNet) and a LogisticRegression meta-learner with `class_weight="balanced"`.
+The current best ensemble is a WeightedVotingEnsemble (soft VotingClassifier with inverse-log-loss weights) using 4 base models (XGBoost, RandomForest, LogisticRegression, NeuralNet). Selected over VotingEnsemble (uniform weights) and StackingEnsemble by validation log_loss.
 
 **Returns:** Dict with `"model"` and `"name"` keys
 
@@ -818,7 +818,51 @@ def validate_against_live(
 
 Validates model predictions against played WC2026 matches. Loads live results, matches them to WC2026 features, predicts outcomes (with swapped fixture handling), and computes accuracy and log-loss.
 
-**Returns:** Dict with keys `accuracy`, `log_loss`, `total_matches`, `correct`, `results` (DataFrame). Empty dict if no live data available.
+**Returns:** Dict with keys `accuracy_argmax`, `accuracy_threshold`, `correct_argmax`, `correct_threshold`, `log_loss`, `total_matches`, `results` (DataFrame). Empty dict if no live data available.
+
+The function returns both `accuracy_argmax` (standard argmax prediction accuracy) and `accuracy_threshold` (accuracy using draw-threshold prediction). The `results` DataFrame contains a `draw_ratio` column showing the ratio of draw probability to the max non-draw probability for each match.
+
+---
+
+### `prediction.py`
+
+#### `predict_with_draw_threshold(model, X, draw_threshold=0.85) -> np.ndarray`
+
+```python
+def predict_with_draw_threshold(
+    model,
+    X: np.ndarray,
+    draw_threshold: float = 0.85,
+) -> np.ndarray
+```
+
+Predicts class labels with a draw-aware threshold. If the ratio of draw probability to the max non-draw probability exceeds `draw_threshold`, the prediction is overridden to draw (class 1).
+
+**Parameters:**
+- `model` -- Trained model with `predict_proba` method
+- `X` -- Feature matrix
+- `draw_threshold` -- Threshold for draw ratio (draw_prob / max(non_draw_probs)) above which draw is predicted (default: 0.85)
+
+**Returns:** Array of predicted class labels
+
+#### `predict_proba_with_draw_boost(model, X, draw_boost=1.0) -> np.ndarray`
+
+```python
+def predict_proba_with_draw_boost(
+    model,
+    X: np.ndarray,
+    draw_boost: float = 1.0,
+) -> np.ndarray
+```
+
+Predicts class probabilities with an optional boost to the draw class. When `draw_boost > 1.0`, the draw probability column is multiplied by the boost factor and probabilities are renormalized to sum to 1.
+
+**Parameters:**
+- `model` -- Trained model with `predict_proba` method
+- `X` -- Feature matrix
+- `draw_boost` -- Multiplicative boost for draw probability (default: 1.0, no boost)
+
+**Returns:** Array of predicted probabilities (N x 3)
 
 ---
 
@@ -1029,7 +1073,7 @@ class WorldCupSimulator:
     )
 ```
 
-Orchestrates the full tournament simulation. By default, loads the XGBoost model (`xgboost.joblib`) for speed (6.6 MB, fast inference). Falls back to `best_model.joblib` if XGBoost is not available.
+Orchestrates the full tournament simulation. By default, loads the XGBoost model (`xgboost.joblib`) for speed (819KB compressed). Falls back to `best_model.joblib` if XGBoost is not available.
 
 **Parameters:**
 - `model` -- Pre-loaded model (overrides file loading)

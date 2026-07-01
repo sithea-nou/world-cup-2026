@@ -7,14 +7,13 @@ from src.config import (
     GROUP_LETTERS,
     N_SIMULATIONS,
     PROCESSED_DIR,
-    RAW_DIR,
     RANDOM_STATE,
+    RAW_DIR,
     WC_GROUP_DRAW_RATE,
 )
 from src.helpers import logger
 from src.simulation.group_stage import GroupStageSimulator
 from src.simulation.knockout_stage import KnockoutStageSimulator
-
 
 DEFAULT_SIMULATION_MODEL = "xgboost"
 
@@ -126,7 +125,18 @@ class WorldCupSimulator:
         self.model = joblib.load(chosen_path)
         logger.info(f"Loaded simulation model from {chosen_path}")
 
-    def _apply_live_results(self, group_results: list[pd.DataFrame]) -> tuple[list[pd.DataFrame], list[str]]:
+    def _get_played_match_pairs(self) -> set:
+        if self.live_results.empty:
+            return set()
+        played = set()
+        for _, match in self.live_results.iterrows():
+            played.add((match["home_team"], match["away_team"]))
+        return played
+
+    def _apply_live_results(
+        self,
+        group_results: list[pd.DataFrame],
+    ) -> tuple[list[pd.DataFrame], list[str]]:
         if self.live_results.empty:
             return group_results, []
 
@@ -143,25 +153,37 @@ class WorldCupSimulator:
                     team_row_away = group_df[group_df["team"] == away].index[0]
 
                     if home_score > away_score:
-                        group_df.at[team_row_home, "points"] = group_df.at[team_row_home, "points"] + 3
-                        group_df.at[team_row_home, "wins"] = group_df.at[team_row_home, "wins"] + 1
-                        group_df.at[team_row_away, "losses"] = group_df.at[team_row_away, "losses"] + 1
+                        h = team_row_home
+                        a = team_row_away
+                        group_df.at[h, "points"] += 3
+                        group_df.at[h, "wins"] += 1
+                        group_df.at[a, "losses"] += 1
                     elif home_score < away_score:
-                        group_df.at[team_row_away, "points"] = group_df.at[team_row_away, "points"] + 3
-                        group_df.at[team_row_away, "wins"] = group_df.at[team_row_away, "wins"] + 1
-                        group_df.at[team_row_home, "losses"] = group_df.at[team_row_home, "losses"] + 1
+                        h = team_row_home
+                        a = team_row_away
+                        group_df.at[a, "points"] += 3
+                        group_df.at[a, "wins"] += 1
+                        group_df.at[h, "losses"] += 1
                     else:
-                        group_df.at[team_row_home, "points"] = group_df.at[team_row_home, "points"] + 1
-                        group_df.at[team_row_away, "points"] = group_df.at[team_row_away, "points"] + 1
-                        group_df.at[team_row_home, "draws"] = group_df.at[team_row_home, "draws"] + 1
-                        group_df.at[team_row_away, "draws"] = group_df.at[team_row_away, "draws"] + 1
+                        h = team_row_home
+                        a = team_row_away
+                        group_df.at[h, "points"] += 1
+                        group_df.at[a, "points"] += 1
+                        group_df.at[h, "draws"] += 1
+                        group_df.at[a, "draws"] += 1
 
-                    group_df.at[team_row_home, "goals_for"] = group_df.at[team_row_home, "goals_for"] + home_score
-                    group_df.at[team_row_home, "goals_against"] = group_df.at[team_row_home, "goals_against"] + away_score
-                    group_df.at[team_row_away, "goals_for"] = group_df.at[team_row_away, "goals_for"] + away_score
-                    group_df.at[team_row_away, "goals_against"] = group_df.at[team_row_away, "goals_against"] + home_score
-                    group_df.at[team_row_home, "goal_diff"] = group_df.at[team_row_home, "goals_for"] - group_df.at[team_row_home, "goals_against"]
-                    group_df.at[team_row_away, "goal_diff"] = group_df.at[team_row_away, "goals_for"] - group_df.at[team_row_away, "goals_against"]
+                    h = team_row_home
+                    a = team_row_away
+                    group_df.at[h, "goals_for"] += home_score
+                    group_df.at[h, "goals_against"] += away_score
+                    group_df.at[a, "goals_for"] += away_score
+                    group_df.at[a, "goals_against"] += home_score
+                    group_df.at[h, "goal_diff"] = (
+                        group_df.at[h, "goals_for"] - group_df.at[h, "goals_against"]
+                    )
+                    group_df.at[a, "goal_diff"] = (
+                        group_df.at[a, "goals_for"] - group_df.at[a, "goals_against"]
+                    )
 
             group_df = group_df.sort_values(
                 ["points", "goal_diff", "goals_for"], ascending=False
@@ -170,6 +192,7 @@ class WorldCupSimulator:
             group_results[i] = group_df
 
         from src.simulation.group_stage import GroupStageSimulator
+
         temp_sim = GroupStageSimulator(self.model, self.feature_cols, self.groups_df)
         third_place_teams = temp_sim.determine_third_place_qualifiers(group_results)
 
@@ -190,18 +213,28 @@ class WorldCupSimulator:
         )
 
         all_teams = self.groups_df["team"].unique()
-        round_counts = {team: {"ro32": 0, "ro16": 0, "qf": 0, "sf": 0, "final": 0, "winner": 0} for team in all_teams}
+        round_counts = {
+            team: {"ro32": 0, "ro16": 0, "qf": 0, "sf": 0, "final": 0, "winner": 0}
+            for team in all_teams
+        }
 
         group_advancement_counts = {}
         for group_letter in GROUP_LETTERS:
             group_teams = self.groups_df[self.groups_df["group"] == group_letter]["team"].tolist()
             for team in group_teams:
                 group_advancement_counts[team] = {
-                    "1st": 0, "2nd": 0, "3rd": 0, "4th": 0, "advance": 0, "group": group_letter,
+                    "1st": 0,
+                    "2nd": 0,
+                    "3rd": 0,
+                    "4th": 0,
+                    "advance": 0,
+                    "group": group_letter,
                 }
 
         for sim in tqdm(range(self.n_simulations), desc="Tournament simulations"):
-            group_results, third_place_teams = group_simulator.simulate_all_groups(self.wc_features)
+            group_results, third_place_teams = group_simulator.simulate_all_groups(
+                self.wc_features, played_matches=self._get_played_match_pairs()
+            )
 
             if not self.live_results.empty:
                 group_results, third_place_teams = self._apply_live_results(group_results)
@@ -283,7 +316,10 @@ class WorldCupSimulator:
             )
 
         group_df = pd.DataFrame(group_probs)
-        group_df = group_df.sort_values(["group", "prob_advance"], ascending=[True, False]).reset_index(drop=True)
+        group_df = group_df.sort_values(
+            ["group", "prob_advance"],
+            ascending=[True, False],
+        ).reset_index(drop=True)
 
         group_out_path = PROCESSED_DIR / "group_stage_probabilities.csv"
         group_df.to_csv(group_out_path, index=False)
@@ -414,5 +450,5 @@ if __name__ == "__main__":
     print("\nTournament Probabilities:")
     print(results.to_string(index=False))
 
-    print(f"\nTop 10 winners:")
+    print("\nTop 10 winners:")
     print(results.head(10)[["team", "prob_winner"]].to_string(index=False))

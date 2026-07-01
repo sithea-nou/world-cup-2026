@@ -1,14 +1,13 @@
+from itertools import combinations
+
 import joblib
 import numpy as np
 import pandas as pd
-from itertools import combinations
 from tqdm import tqdm
 
 from src.config import (
-    ADVANCE_PER_GROUP,
     BEST_THIRD_ADVANCE,
     GROUP_LETTERS,
-    HOST_NATIONS,
     N_SIMULATIONS,
     PROCESSED_DIR,
     RANDOM_STATE,
@@ -18,7 +17,14 @@ from src.helpers import logger
 
 
 class GroupStageSimulator:
-    def __init__(self, model, feature_cols: list[str], groups_df: pd.DataFrame, n_simulations: int = N_SIMULATIONS, imputer=None):
+    def __init__(
+        self,
+        model,
+        feature_cols: list[str],
+        groups_df: pd.DataFrame,
+        n_simulations: int = N_SIMULATIONS,
+        imputer=None,
+    ):
         self.model = model
         self.feature_cols = feature_cols
         self.groups_df = groups_df
@@ -86,7 +92,12 @@ class GroupStageSimulator:
 
         return np.array([0.4, 0.3, 0.3])
 
-    def simulate_match(self, home: str, away: str, wc_features: pd.DataFrame) -> tuple[str, int, int]:
+    def simulate_match(
+        self,
+        home: str,
+        away: str,
+        wc_features: pd.DataFrame,
+    ) -> tuple[str, int, int]:
         probs = self._predict_match(home, away, wc_features)
 
         probs = probs / probs.sum()
@@ -108,16 +119,36 @@ class GroupStageSimulator:
             away_goals = home_goals
             return outcome, home_goals, away_goals
 
-    def simulate_group(self, group_letter: str, wc_features: pd.DataFrame) -> pd.DataFrame:
+    def simulate_group(
+        self, group_letter: str, wc_features: pd.DataFrame, played_matches: set | None = None
+    ) -> pd.DataFrame:
         group_teams = self.groups_df[self.groups_df["group"] == group_letter]["team"].tolist()
 
         if len(group_teams) < 4:
             logger.warning(f"Group {group_letter} has fewer than 4 teams: {group_teams}")
             return pd.DataFrame()
 
-        standings = {team: {"points": 0, "goals_for": 0, "goals_against": 0, "wins": 0, "draws": 0, "losses": 0} for team in group_teams}
+        standings = {
+            team: {
+                "points": 0,
+                "goals_for": 0,
+                "goals_against": 0,
+                "wins": 0,
+                "draws": 0,
+                "losses": 0,
+            }
+            for team in group_teams
+        }
+
+        if played_matches is None:
+            played_matches = set()
 
         for home, away in combinations(group_teams, 2):
+            pair = (home, away)
+            pair_rev = (away, home)
+            if pair in played_matches or pair_rev in played_matches:
+                continue
+
             outcome, home_goals, away_goals = self.simulate_match(home, away, wc_features)
 
             standings[home]["goals_for"] += home_goals
@@ -156,7 +187,10 @@ class GroupStageSimulator:
             )
 
         df = pd.DataFrame(results)
-        df = df.sort_values(["points", "goal_diff", "goals_for"], ascending=False).reset_index(drop=True)
+        df = df.sort_values(
+            ["points", "goal_diff", "goals_for"],
+            ascending=False,
+        ).reset_index(drop=True)
         df["position"] = range(1, len(df) + 1)
 
         return df
@@ -183,10 +217,14 @@ class GroupStageSimulator:
 
         return third_df.head(BEST_THIRD_ADVANCE)["team"].tolist()
 
-    def simulate_all_groups(self, wc_features: pd.DataFrame) -> tuple[list[pd.DataFrame], list[str]]:
+    def simulate_all_groups(
+        self,
+        wc_features: pd.DataFrame,
+        played_matches: set | None = None,
+    ) -> tuple[list[pd.DataFrame], list[str]]:
         all_results = []
         for group_letter in GROUP_LETTERS:
-            group_result = self.simulate_group(group_letter, wc_features)
+            group_result = self.simulate_group(group_letter, wc_features, played_matches)
             all_results.append(group_result)
 
         third_place_teams = self.determine_third_place_qualifiers(all_results)
@@ -251,7 +289,10 @@ class GroupStageSimulator:
             )
 
         df = pd.DataFrame(results)
-        df = df.sort_values(["group", "prob_advance"], ascending=[True, False]).reset_index(drop=True)
+        df = df.sort_values(
+            ["group", "prob_advance"],
+            ascending=[True, False],
+        ).reset_index(drop=True)
 
         out_path = PROCESSED_DIR / "group_stage_probabilities.csv"
         df.to_csv(out_path, index=False)
